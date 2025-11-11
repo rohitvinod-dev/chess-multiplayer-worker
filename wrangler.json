@@ -6,6 +6,14 @@
     {
       "new_sqlite_classes": ["Chat"],
       "tag": "v1"
+    },
+    {
+      "deleted_classes": ["Matchmaker"],
+      "tag": "v2"
+    },
+    {
+      "new_sqlite_classes": ["MatchmakingQueue"],
+      "tag": "v3"
     }
   ],
   "assets": {
@@ -21,6 +29,14 @@
       {
         "class_name": "Chat",
         "name": "Chat"
+      },
+      {
+        "class_name": "GameRoom",
+        "name": "GAME_ROOM"
+      },
+      {
+        "class_name": "MatchmakingQueue",
+        "name": "MATCHMAKING_QUEUE"
       }
     ]
   },
