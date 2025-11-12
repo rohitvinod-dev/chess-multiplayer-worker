@@ -243,14 +243,26 @@ export class MatchmakingQueue {
   private async handleJoinQueue(request: Request): Promise<Response> {
     const entry = (await request.json()) as QueueEntry;
 
-    // Calculate rating range (expands over time)
+    // Calculate rating range (expands over time, optimized for 20s timeout)
     const waitTimeSeconds = (Date.now() - entry.joinedAt) / 1000;
-    const ratingRangeExpansion = Math.floor(waitTimeSeconds / 15) * 50;
-    const baseRange = 200;
-    const range = baseRange + ratingRangeExpansion;
 
-    entry.minRating = entry.rating - range;
-    entry.maxRating = entry.rating + range;
+    // Base range: 150
+    // Expands by 50 every 5 seconds
+    // Extra aggressive expansion in final 2 seconds
+    let baseRange = 150;
+    let ratingRangeExpansion = Math.floor(waitTimeSeconds / 5) * 50;
+
+    // Aggressive expansion in final 2 seconds (18s+)
+    if (waitTimeSeconds >= 18) {
+      ratingRangeExpansion += 150; // Add extra 150 in last 2 seconds
+    }
+
+    const range = baseRange + ratingRangeExpansion;
+    // Cap at reasonable maximum to avoid absurd mismatches
+    const cappedRange = Math.min(range, 600);
+
+    entry.minRating = entry.rating - cappedRange;
+    entry.maxRating = entry.rating + cappedRange;
 
     // Try to find a match
     const opponentIndex = this.queue.findIndex((opponent) => {
@@ -280,12 +292,15 @@ export class MatchmakingQueue {
       const webSocketUrl = `${baseUrl}/party/gameroom/${roomId}`;
 
       const accessToken = this.generateAccessToken(entry.playerId);
+      const playerColor = Math.random() > 0.5 ? "white" : "black";
 
       return new Response(
         JSON.stringify({
           matched: true,
           roomId,
-          color: Math.random() > 0.5 ? "white" : "black",
+          color: playerColor,
+          opponentId: opponent.playerId,
+          opponentDisplayName: opponent.displayName,
           accessToken,
           webSocketUrl,
         }),
