@@ -14,6 +14,10 @@
     {
       "new_sqlite_classes": ["MatchmakingQueue"],
       "tag": "v3"
+    },
+    {
+      "new_sqlite_classes": ["StatsTracker"],
+      "tag": "v4"
     }
   ],
   "assets": {
@@ -37,6 +41,10 @@
       {
         "class_name": "MatchmakingQueue",
         "name": "MATCHMAKING_QUEUE"
+      },
+      {
+        "class_name": "StatsTracker",
+        "name": "STATS_TRACKER"
       }
     ]
   },

@@ -13,6 +13,7 @@ export interface Env {
   Chat: DurableObjectNamespace;
   GAME_ROOM: DurableObjectNamespace;
   MATCHMAKING_QUEUE: DurableObjectNamespace;
+  STATS_TRACKER: DurableObjectNamespace;
   ASSETS: Fetcher;
 }
 
@@ -122,6 +123,15 @@ export default {
       );
     }
 
+    // ========== STATS ENDPOINTS ==========
+    if (url.pathname === "/stats/online-players" && request.method === "GET") {
+      return handleOnlinePlayersStats(env);
+    }
+
+    if (url.pathname === "/stats/games-24h" && request.method === "GET") {
+      return handleGames24hStats(env);
+    }
+
     // Fall back to static assets
     return env.ASSETS.fetch(request);
   },
@@ -214,6 +224,63 @@ async function handleMatchmake(
   }
 }
 
+// ========== STATS HANDLERS ==========
+async function handleOnlinePlayersStats(env: Env): Promise<Response> {
+  try {
+    const statsNamespace = env.STATS_TRACKER;
+    const statsId = statsNamespace.idFromName("global-stats");
+    const statsStub = statsNamespace.get(statsId);
+
+    const response = await statsStub.fetch(
+      new Request("https://internal/stats/online-players", {
+        method: "GET",
+      })
+    );
+
+    return response;
+  } catch (error) {
+    console.error("Error fetching online players stats:", error);
+    return new Response(
+      JSON.stringify({ count: 0, error: String(error) }),
+      {
+        status: 200,
+        headers: {
+          "Content-Type": "application/json",
+          "Access-Control-Allow-Origin": "*"
+        }
+      }
+    );
+  }
+}
+
+async function handleGames24hStats(env: Env): Promise<Response> {
+  try {
+    const statsNamespace = env.STATS_TRACKER;
+    const statsId = statsNamespace.idFromName("global-stats");
+    const statsStub = statsNamespace.get(statsId);
+
+    const response = await statsStub.fetch(
+      new Request("https://internal/stats/games-24h", {
+        method: "GET",
+      })
+    );
+
+    return response;
+  } catch (error) {
+    console.error("Error fetching games-24h stats:", error);
+    return new Response(
+      JSON.stringify({ count: 0, error: String(error) }),
+      {
+        status: 200,
+        headers: {
+          "Content-Type": "application/json",
+          "Access-Control-Allow-Origin": "*"
+        }
+      }
+    );
+  }
+}
+
 // ========== MATCHMAKING QUEUE DURABLE OBJECT ==========
 export class MatchmakingQueue {
   private state: DurableObjectState;
@@ -287,6 +354,23 @@ export class MatchmakingQueue {
       const gameRoomId = gameRoomNamespace.idFromName(roomId);
       const gameRoomStub = gameRoomNamespace.get(gameRoomId);
 
+      // Track game creation in stats
+      try {
+        const statsNamespace = this.env.STATS_TRACKER;
+        const statsId = statsNamespace.idFromName("global-stats");
+        const statsStub = statsNamespace.get(statsId);
+        await statsStub.fetch(
+          new Request("https://internal/stats/game-created", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ gameId: roomId }),
+          })
+        );
+      } catch (error) {
+        console.error("Failed to track game creation:", error);
+        // Don't fail the match if stats tracking fails
+      }
+
       // Generate WebSocket URL
       const baseUrl = new URL(request.url).origin || "https://chess-multiplayer-worker.rohitvinod-dev.workers.dev";
       const webSocketUrl = `${baseUrl}/party/gameroom/${roomId}`;
@@ -346,6 +430,187 @@ export class MatchmakingQueue {
     const jsonStr = JSON.stringify(payload);
     // Simple base64 encoding without Buffer
     return btoa(jsonStr);
+  }
+}
+
+// ========== STATS TRACKER DURABLE OBJECT ==========
+export class StatsTracker {
+  private state: DurableObjectState;
+  private env: Env;
+  private sql: SqlStorage;
+
+  constructor(state: DurableObjectState, env: Env) {
+    this.state = state;
+    this.env = env;
+    this.sql = this.state.storage.sql;
+    this.initializeDatabase();
+  }
+
+  private initializeDatabase() {
+    // Table to track active connections (online players)
+    this.sql.exec(
+      `CREATE TABLE IF NOT EXISTS active_connections (
+        connection_id TEXT PRIMARY KEY,
+        player_id TEXT NOT NULL,
+        connected_at INTEGER NOT NULL
+      )`
+    );
+
+    // Table to track game creations
+    this.sql.exec(
+      `CREATE TABLE IF NOT EXISTS game_history (
+        game_id TEXT PRIMARY KEY,
+        created_at INTEGER NOT NULL
+      )`
+    );
+
+    // Create index for faster 24h queries
+    this.sql.exec(
+      `CREATE INDEX IF NOT EXISTS idx_game_created_at ON game_history(created_at)`
+    );
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const corsHeaders = {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type",
+    };
+
+    // Handle CORS preflight
+    if (request.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: corsHeaders });
+    }
+
+    // Get online players count
+    if (url.pathname === "/stats/online-players" && request.method === "GET") {
+      try {
+        const result = this.sql.exec(
+          `SELECT COUNT(DISTINCT player_id) as count FROM active_connections`
+        );
+        const count = result.toArray()[0]?.count || 0;
+
+        return new Response(
+          JSON.stringify({ count }),
+          { status: 200, headers: corsHeaders }
+        );
+      } catch (error) {
+        console.error("Error getting online players:", error);
+        return new Response(
+          JSON.stringify({ count: 0, error: String(error) }),
+          { status: 200, headers: corsHeaders }
+        );
+      }
+    }
+
+    // Get games in last 24 hours
+    if (url.pathname === "/stats/games-24h" && request.method === "GET") {
+      try {
+        const oneDayAgo = Date.now() - (24 * 60 * 60 * 1000);
+
+        // Clean up old games (older than 48 hours) to prevent unlimited growth
+        const twoDaysAgo = Date.now() - (48 * 60 * 60 * 1000);
+        this.sql.exec(
+          `DELETE FROM game_history WHERE created_at < ${twoDaysAgo}`
+        );
+
+        // Get count of games in last 24 hours
+        const result = this.sql.exec(
+          `SELECT COUNT(*) as count FROM game_history WHERE created_at >= ${oneDayAgo}`
+        );
+        const count = result.toArray()[0]?.count || 0;
+
+        return new Response(
+          JSON.stringify({ count }),
+          { status: 200, headers: corsHeaders }
+        );
+      } catch (error) {
+        console.error("Error getting games-24h:", error);
+        return new Response(
+          JSON.stringify({ count: 0, error: String(error) }),
+          { status: 200, headers: corsHeaders }
+        );
+      }
+    }
+
+    // Track player connection
+    if (url.pathname === "/stats/player-connected" && request.method === "POST") {
+      try {
+        const body = await request.json() as { playerId: string; connectionId: string };
+
+        // Clean up stale connections (older than 5 minutes)
+        const fiveMinutesAgo = Date.now() - (5 * 60 * 1000);
+        this.sql.exec(
+          `DELETE FROM active_connections WHERE connected_at < ${fiveMinutesAgo}`
+        );
+
+        // Add new connection
+        this.sql.exec(
+          `INSERT OR REPLACE INTO active_connections (connection_id, player_id, connected_at)
+           VALUES ('${body.connectionId}', '${body.playerId}', ${Date.now()})`
+        );
+
+        return new Response(
+          JSON.stringify({ success: true }),
+          { status: 200, headers: corsHeaders }
+        );
+      } catch (error) {
+        console.error("Error tracking player connection:", error);
+        return new Response(
+          JSON.stringify({ success: false, error: String(error) }),
+          { status: 500, headers: corsHeaders }
+        );
+      }
+    }
+
+    // Track player disconnection
+    if (url.pathname === "/stats/player-disconnected" && request.method === "POST") {
+      try {
+        const body = await request.json() as { connectionId: string };
+
+        this.sql.exec(
+          `DELETE FROM active_connections WHERE connection_id = '${body.connectionId}'`
+        );
+
+        return new Response(
+          JSON.stringify({ success: true }),
+          { status: 200, headers: corsHeaders }
+        );
+      } catch (error) {
+        console.error("Error tracking player disconnection:", error);
+        return new Response(
+          JSON.stringify({ success: false, error: String(error) }),
+          { status: 500, headers: corsHeaders }
+        );
+      }
+    }
+
+    // Track game creation
+    if (url.pathname === "/stats/game-created" && request.method === "POST") {
+      try {
+        const body = await request.json() as { gameId: string };
+
+        this.sql.exec(
+          `INSERT OR IGNORE INTO game_history (game_id, created_at)
+           VALUES ('${body.gameId}', ${Date.now()})`
+        );
+
+        return new Response(
+          JSON.stringify({ success: true }),
+          { status: 200, headers: corsHeaders }
+        );
+      } catch (error) {
+        console.error("Error tracking game creation:", error);
+        return new Response(
+          JSON.stringify({ success: false, error: String(error) }),
+          { status: 500, headers: corsHeaders }
+        );
+      }
+    }
+
+    return new Response("Not found", { status: 404, headers: corsHeaders });
   }
 }
 
