@@ -83,6 +83,8 @@ export class Chat extends Server<Env> {
 }
 
 // ============ MATCHMAKING QUEUE ============
+const MATCHMAKING_TIMEOUT_SECONDS = 30; // Task 1: Increased from 20 to 30 seconds
+
 interface QueueEntry {
   playerId: string;
   displayName: string;
@@ -92,6 +94,7 @@ interface QueueEntry {
   joinedAt: number;
   minRating: number;
   maxRating: number;
+  expiresAt: number; // Task 1: Added for cleanup
 }
 
 // ============ MAIN WORKER ============
@@ -286,11 +289,125 @@ export class MatchmakingQueue {
   private state: DurableObjectState;
   private env: Env;
   private queue: QueueEntry[] = [];
+  private queueLoaded: boolean = false; // Task 3: Track if queue loaded from storage
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
     this.env = env;
     this.queue = [];
+  }
+
+  // Task 3: Load queue from storage on initialization
+  private async loadQueue(): Promise<void> {
+    if (this.queueLoaded) return;
+
+    const stored = await this.state.storage.get<QueueEntry[]>('queue');
+    if (stored) {
+      // Filter out expired entries on load
+      const now = Date.now();
+      this.queue = stored.filter(entry => entry.expiresAt > now);
+    } else {
+      this.queue = [];
+    }
+
+    this.queueLoaded = true;
+    console.log(`MatchmakingQueue: Loaded ${this.queue.length} entries from storage`);
+  }
+
+  // Task 3: Persist queue after changes
+  private async saveQueue(): Promise<void> {
+    await this.state.storage.put('queue', this.queue);
+    console.log(`MatchmakingQueue: Saved ${this.queue.length} entries to storage`);
+  }
+
+  // Task 2: Improved rating range calculation algorithm for 30-second timeout
+  private calculateRatingRange(entry: QueueEntry): { min: number; max: number } {
+    const waitTimeSeconds = (Date.now() - entry.joinedAt) / 1000;
+
+    // More aggressive expansion over 30 seconds
+    let range: number;
+
+    if (waitTimeSeconds < 10) {
+      // First 10 seconds: ±150 (tight matching)
+      range = 150;
+    } else if (waitTimeSeconds < 20) {
+      // 10-20 seconds: ±150 to ±250
+      range = 150 + ((waitTimeSeconds - 10) * 10);
+    } else if (waitTimeSeconds < 25) {
+      // 20-25 seconds: ±250 to ±400
+      range = 250 + ((waitTimeSeconds - 20) * 30);
+    } else {
+      // 25-30 seconds: ±400 to ±600 (any match)
+      range = 400 + ((waitTimeSeconds - 25) * 40);
+    }
+
+    // Cap at 600
+    const cappedRange = Math.min(range, 600);
+
+    return {
+      min: entry.rating - cappedRange,
+      max: entry.rating + cappedRange,
+    };
+  }
+
+  // Task 4: Fix bidirectional rating range matching
+  private findMatch(entry: QueueEntry): QueueEntry | null {
+    // Recalculate rating range for entry (time-based expansion)
+    const entryRange = this.calculateRatingRange(entry);
+    entry.minRating = entryRange.min;
+    entry.maxRating = entryRange.max;
+
+    for (const opponent of this.queue) {
+      // Skip if different game mode
+      if (opponent.gameMode !== entry.gameMode) continue;
+
+      // Skip if same player
+      if (opponent.playerId === entry.playerId) continue;
+
+      // Recalculate opponent's rating range based on their wait time
+      const opponentRange = this.calculateRatingRange(opponent);
+      opponent.minRating = opponentRange.min;
+      opponent.maxRating = opponentRange.max;
+
+      // BIDIRECTIONAL CHECK: Both players must be within each other's range
+      const entryAcceptsOpponent =
+        opponent.rating >= entry.minRating &&
+        opponent.rating <= entry.maxRating;
+
+      const opponentAcceptsEntry =
+        entry.rating >= opponent.minRating &&
+        entry.rating <= opponent.maxRating;
+
+      if (entryAcceptsOpponent && opponentAcceptsEntry) {
+        console.log(`MatchmakingQueue: Match found!`);
+        console.log(`  Player ${entry.playerId} (${entry.rating}) range: [${entry.minRating}, ${entry.maxRating}]`);
+        console.log(`  Player ${opponent.playerId} (${opponent.rating}) range: [${opponent.minRating}, ${opponent.maxRating}]`);
+        return opponent;
+      }
+    }
+
+    console.log(`MatchmakingQueue: No match found for player ${entry.playerId} (${entry.rating})`);
+    return null;
+  }
+
+  // Task 3: Cleanup expired entries
+  private async cleanupExpiredEntries(): Promise<void> {
+    const now = Date.now();
+    const initialCount = this.queue.length;
+
+    this.queue = this.queue.filter(entry => entry.expiresAt > now);
+
+    const removedCount = initialCount - this.queue.length;
+    if (removedCount > 0) {
+      console.log(`MatchmakingQueue: Cleaned up ${removedCount} expired entries`);
+      await this.saveQueue();
+    }
+  }
+
+  private generateGameRoomId(player1: string, player2: string): string {
+    const timestamp = Date.now().toString(36);
+    const random = Math.random().toString(36).slice(2, 9);
+    return `game-${timestamp}-${random}`;
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -300,59 +417,76 @@ export class MatchmakingQueue {
       return this.handleJoinQueue(request);
     }
 
+    // Task 7: Queue status polling endpoint
     if (url.pathname === "/queue/status" && request.method === "GET") {
-      return this.handleQueueStatus();
+      return this.handleStatusCheck(request);
+    }
+
+    // Task 7: Leave queue endpoint
+    if (url.pathname === "/queue/leave" && request.method === "POST") {
+      return this.handleLeaveQueue(request);
+    }
+
+    // Legacy queue status endpoint
+    if (url.pathname === "/queue/info" && request.method === "GET") {
+      return this.handleQueueInfo();
     }
 
     return new Response("Not found", { status: 404 });
   }
 
   private async handleJoinQueue(request: Request): Promise<Response> {
-    const entry = (await request.json()) as QueueEntry;
+    await this.loadQueue();
 
-    // Calculate rating range (expands over time, optimized for 20s timeout)
-    const waitTimeSeconds = (Date.now() - entry.joinedAt) / 1000;
+    // Clean up expired entries first
+    await this.cleanupExpiredEntries();
 
-    // Base range: 150
-    // Expands by 50 every 5 seconds
-    // Extra aggressive expansion in final 2 seconds
-    let baseRange = 150;
-    let ratingRangeExpansion = Math.floor(waitTimeSeconds / 5) * 50;
+    const body = (await request.json()) as {
+      playerId: string;
+      displayName: string;
+      rating: number;
+      isProvisional: boolean;
+      gameMode: GameMode;
+      joinedAt: number;
+    };
 
-    // Aggressive expansion in final 2 seconds (18s+)
-    if (waitTimeSeconds >= 18) {
-      ratingRangeExpansion += 150; // Add extra 150 in last 2 seconds
+    // Task 3: Check for duplicate entry (deduplication)
+    const existingIndex = this.queue.findIndex(e => e.playerId === body.playerId);
+    if (existingIndex !== -1) {
+      // Remove old entry, will add fresh one
+      this.queue.splice(existingIndex, 1);
+      console.log(`MatchmakingQueue: Removed duplicate entry for player ${body.playerId}`);
     }
 
-    const range = baseRange + ratingRangeExpansion;
-    // Cap at reasonable maximum to avoid absurd mismatches
-    const cappedRange = Math.min(range, 600);
+    // Create new entry with expiration
+    const now = Date.now();
+    const entry: QueueEntry = {
+      playerId: body.playerId,
+      displayName: body.displayName,
+      rating: body.rating,
+      isProvisional: body.isProvisional,
+      gameMode: body.gameMode,
+      joinedAt: body.joinedAt || now,
+      minRating: 0,
+      maxRating: 0,
+      expiresAt: now + (MATCHMAKING_TIMEOUT_SECONDS * 1000), // Task 1: 30 second timeout
+    };
 
-    entry.minRating = entry.rating - cappedRange;
-    entry.maxRating = entry.rating + cappedRange;
+    // Calculate initial rating range
+    const range = this.calculateRatingRange(entry);
+    entry.minRating = range.min;
+    entry.maxRating = range.max;
 
-    // Try to find a match
-    const opponentIndex = this.queue.findIndex((opponent) => {
-      if (opponent.gameMode !== entry.gameMode) return false;
-      if (opponent.playerId === entry.playerId) return false;
-      if (
-        opponent.rating < entry.minRating ||
-        opponent.rating > entry.maxRating
-      )
-        return false;
-      return true;
-    });
+    // Task 4: Try to find a match with bidirectional check
+    const match = this.findMatch(entry);
 
-    if (opponentIndex !== -1) {
-      // Match found!
-      const opponent = this.queue[opponentIndex];
-      this.queue.splice(opponentIndex, 1);
+    if (match) {
+      // Match found - remove opponent from queue
+      this.queue = this.queue.filter(e => e.playerId !== match.playerId);
+      await this.saveQueue();
 
       // Create game room
-      const gameRoomNamespace = this.env.GAME_ROOM;
-      const roomId = `game-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
-      const gameRoomId = gameRoomNamespace.idFromName(roomId);
-      const gameRoomStub = gameRoomNamespace.get(gameRoomId);
+      const roomId = this.generateGameRoomId(entry.playerId, match.playerId);
 
       // Track game creation in stats
       try {
@@ -383,30 +517,151 @@ export class MatchmakingQueue {
           matched: true,
           roomId,
           color: playerColor,
-          opponentId: opponent.playerId,
-          opponentDisplayName: opponent.displayName,
+          opponentId: match.playerId,
+          opponentDisplayName: match.displayName,
+          opponentRating: match.rating,
           accessToken,
           webSocketUrl,
         }),
         { status: 200, headers: { "Content-Type": "application/json" } }
       );
-    } else {
-      // No match, add to queue
-      this.queue.push(entry);
-
-      return new Response(
-        JSON.stringify({
-          matched: false,
-          queuePosition: this.queue.length,
-          estimatedWait:
-            30 - (Date.now() - entry.joinedAt) / 1000,
-        }),
-        { status: 200, headers: { "Content-Type": "application/json" } }
-      );
     }
+
+    // No match - add to queue
+    this.queue.push(entry);
+    await this.saveQueue();
+
+    return new Response(
+      JSON.stringify({
+        matched: false,
+        queuePosition: this.queue.length,
+        estimatedWait: MATCHMAKING_TIMEOUT_SECONDS,
+      }),
+      { status: 200, headers: { "Content-Type": "application/json" } }
+    );
   }
 
-  private handleQueueStatus(): Response {
+  // Task 7: Status check endpoint with match retry
+  private async handleStatusCheck(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const playerId = url.searchParams.get('playerId');
+
+    if (!playerId) {
+      return new Response(JSON.stringify({ error: 'Missing playerId' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
+    await this.loadQueue();
+    await this.cleanupExpiredEntries();
+
+    // Check if player is still in queue
+    const entry = this.queue.find(e => e.playerId === playerId);
+
+    if (!entry) {
+      return new Response(JSON.stringify({
+        inQueue: false,
+        message: 'Player not in queue',
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
+    // Try to find match with updated ranges (time has passed, ranges may have expanded)
+    const match = this.findMatch(entry);
+
+    if (match) {
+      // Match found!
+      this.queue = this.queue.filter(e =>
+        e.playerId !== playerId && e.playerId !== match.playerId
+      );
+      await this.saveQueue();
+
+      const roomId = this.generateGameRoomId(playerId, match.playerId);
+
+      // Track game creation in stats
+      try {
+        const statsNamespace = this.env.STATS_TRACKER;
+        const statsId = statsNamespace.idFromName("global-stats");
+        const statsStub = statsNamespace.get(statsId);
+        await statsStub.fetch(
+          new Request("https://internal/stats/game-created", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ gameId: roomId }),
+          })
+        );
+      } catch (error) {
+        console.error("Failed to track game creation:", error);
+      }
+
+      // Generate WebSocket URL
+      const baseUrl = new URL(request.url).origin || "https://chess-multiplayer-worker.rohitvinod-dev.workers.dev";
+      const webSocketUrl = `${baseUrl}/party/gameroom/${roomId}`;
+
+      const accessToken = this.generateAccessToken(playerId);
+      const playerColor = Math.random() > 0.5 ? "white" : "black";
+
+      return new Response(JSON.stringify({
+        inQueue: false,
+        matched: true,
+        roomId,
+        color: playerColor,
+        opponentId: match.playerId,
+        opponentDisplayName: match.displayName,
+        opponentRating: match.rating,
+        accessToken,
+        webSocketUrl,
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
+    // Still waiting
+    const waitTime = (Date.now() - entry.joinedAt) / 1000;
+    const range = this.calculateRatingRange(entry);
+
+    return new Response(JSON.stringify({
+      inQueue: true,
+      matched: false,
+      queuePosition: this.queue.indexOf(entry) + 1,
+      totalInQueue: this.queue.length,
+      waitTimeSeconds: Math.floor(waitTime),
+      currentRatingRange: range,
+      expiresIn: Math.floor((entry.expiresAt - Date.now()) / 1000),
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+
+  // Task 7: Leave queue endpoint
+  private async handleLeaveQueue(request: Request): Promise<Response> {
+    const body = await request.json() as { playerId: string };
+
+    await this.loadQueue();
+
+    const initialLength = this.queue.length;
+    this.queue = this.queue.filter(e => e.playerId !== body.playerId);
+
+    if (this.queue.length < initialLength) {
+      await this.saveQueue();
+      console.log(`MatchmakingQueue: Player ${body.playerId} left queue`);
+    }
+
+    return new Response(JSON.stringify({ success: true }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+
+  private async handleQueueInfo(): Promise<Response> {
+    await this.loadQueue();
+    await this.cleanupExpiredEntries();
+
     return new Response(
       JSON.stringify({
         queueSize: this.queue.length,
@@ -414,6 +669,7 @@ export class MatchmakingQueue {
           gameMode: entry.gameMode,
           rating: entry.rating,
           waitTime: Date.now() - entry.joinedAt,
+          expiresIn: Math.floor((entry.expiresAt - Date.now()) / 1000),
         })),
       }),
       { status: 200, headers: { "Content-Type": "application/json" } }
