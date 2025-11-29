@@ -95,6 +95,19 @@ interface QueueEntry {
   minRating: number;
   maxRating: number;
   expiresAt: number; // Task 1: Added for cleanup
+  origin?: string; // Origin for WebSocket URL generation
+}
+
+interface PendingMatch {
+  roomId: string;
+  color: string;
+  opponentId: string;
+  opponentDisplayName: string;
+  opponentRating: number;
+  accessToken: string;
+  webSocketUrl: string;
+  createdAt: number;
+  expiresAt: number;
 }
 
 // ============ MAIN WORKER ============
@@ -117,10 +130,39 @@ export default {
 
     // ========== HEALTH CHECK ==========
     if (url.pathname === "/health" && request.method === "GET") {
+      try {
+        // Get queue info from matchmaking queue
+        const queueNamespace = env.MATCHMAKING_QUEUE;
+        const queueId = queueNamespace.idFromName("global-queue");
+        const queueStub = queueNamespace.get(queueId);
+
+        const queueResponse = await queueStub.fetch(
+          new Request("https://internal/queue/info", {
+            method: "GET",
+          })
+        );
+
+        if (queueResponse.ok) {
+          const queueData = (await queueResponse.json()) as { queueSize: number };
+          return new Response(
+            JSON.stringify({
+              status: "ok",
+              timestamp: Date.now(),
+              waiting: queueData.queueSize || 0,
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } }
+          );
+        }
+      } catch (error) {
+        console.error("Error fetching queue info:", error);
+      }
+
+      // Fallback if queue info unavailable
       return new Response(
         JSON.stringify({
           status: "ok",
           timestamp: Date.now(),
+          waiting: 0,
         }),
         { status: 200, headers: { "Content-Type": "application/json" } }
       );
@@ -179,7 +221,8 @@ async function handleMatchmake(
     const queueId = queueNamespace.idFromName("global-queue");
     const queueStub = queueNamespace.get(queueId);
 
-    // Add player to queue
+    // Add player to queue - pass the real origin for WebSocket URL generation
+    const realOrigin = new URL(request.url).origin;
     const response = await queueStub.fetch(
       new Request("https://internal/queue/join", {
         method: "POST",
@@ -193,6 +236,7 @@ async function handleMatchmake(
           isProvisional,
           gameMode,
           joinedAt: Date.now(),
+          origin: realOrigin, // Pass the real origin for WebSocket URL generation
         }),
       })
     );
@@ -290,11 +334,14 @@ export class MatchmakingQueue {
   private env: Env;
   private queue: QueueEntry[] = [];
   private queueLoaded: boolean = false; // Task 3: Track if queue loaded from storage
+  private pendingMatches: Map<string, PendingMatch> = new Map(); // Store pending matches for both players
+  private pendingMatchesLoaded: boolean = false;
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
     this.env = env;
     this.queue = [];
+    this.pendingMatches = new Map();
   }
 
   // Task 3: Load queue from storage on initialization
@@ -318,6 +365,49 @@ export class MatchmakingQueue {
   private async saveQueue(): Promise<void> {
     await this.state.storage.put('queue', this.queue);
     console.log(`MatchmakingQueue: Saved ${this.queue.length} entries to storage`);
+  }
+
+  // Load pending matches from storage
+  private async loadPendingMatches(): Promise<void> {
+    if (this.pendingMatchesLoaded) return;
+
+    const stored = await this.state.storage.get<Array<[string, PendingMatch]>>('pendingMatches');
+    if (stored) {
+      // Filter out expired pending matches
+      const now = Date.now();
+      this.pendingMatches = new Map(
+        stored.filter(([_, match]) => match.expiresAt > now)
+      );
+    } else {
+      this.pendingMatches = new Map();
+    }
+
+    this.pendingMatchesLoaded = true;
+    console.log(`MatchmakingQueue: Loaded ${this.pendingMatches.size} pending matches from storage`);
+  }
+
+  // Persist pending matches after changes
+  private async savePendingMatches(): Promise<void> {
+    await this.state.storage.put('pendingMatches', Array.from(this.pendingMatches.entries()));
+    console.log(`MatchmakingQueue: Saved ${this.pendingMatches.size} pending matches to storage`);
+  }
+
+  // Clean up expired pending matches
+  private async cleanupExpiredPendingMatches(): Promise<void> {
+    const now = Date.now();
+    const initialCount = this.pendingMatches.size;
+
+    for (const [playerId, match] of this.pendingMatches.entries()) {
+      if (match.expiresAt <= now) {
+        this.pendingMatches.delete(playerId);
+      }
+    }
+
+    const removedCount = initialCount - this.pendingMatches.size;
+    if (removedCount > 0) {
+      console.log(`MatchmakingQueue: Cleaned up ${removedCount} expired pending matches`);
+      await this.savePendingMatches();
+    }
   }
 
   // Task 2: Improved rating range calculation algorithm for 30-second timeout
@@ -437,9 +527,11 @@ export class MatchmakingQueue {
 
   private async handleJoinQueue(request: Request): Promise<Response> {
     await this.loadQueue();
+    await this.loadPendingMatches();
 
     // Clean up expired entries first
     await this.cleanupExpiredEntries();
+    await this.cleanupExpiredPendingMatches();
 
     const body = (await request.json()) as {
       playerId: string;
@@ -448,7 +540,31 @@ export class MatchmakingQueue {
       isProvisional: boolean;
       gameMode: GameMode;
       joinedAt: number;
+      origin?: string; // Origin from the main worker for WebSocket URL generation
     };
+
+    // CRITICAL FIX: Check if this player has a pending match first
+    const pendingMatch = this.pendingMatches.get(body.playerId);
+    if (pendingMatch) {
+      console.log(`MatchmakingQueue: Player ${body.playerId} has pending match, returning it`);
+      // Remove the pending match so they can't get it again
+      this.pendingMatches.delete(body.playerId);
+      await this.savePendingMatches();
+
+      return new Response(
+        JSON.stringify({
+          matched: true,
+          roomId: pendingMatch.roomId,
+          color: pendingMatch.color,
+          opponentId: pendingMatch.opponentId,
+          opponentDisplayName: pendingMatch.opponentDisplayName,
+          opponentRating: pendingMatch.opponentRating,
+          accessToken: pendingMatch.accessToken,
+          webSocketUrl: pendingMatch.webSocketUrl,
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      );
+    }
 
     // Task 3: Check for duplicate entry (deduplication)
     const existingIndex = this.queue.findIndex(e => e.playerId === body.playerId);
@@ -470,6 +586,7 @@ export class MatchmakingQueue {
       minRating: 0,
       maxRating: 0,
       expiresAt: now + (MATCHMAKING_TIMEOUT_SECONDS * 1000), // Task 1: 30 second timeout
+      origin: body.origin, // Store the origin for WebSocket URL generation
     };
 
     // Calculate initial rating range
@@ -505,13 +622,64 @@ export class MatchmakingQueue {
         // Don't fail the match if stats tracking fails
       }
 
-      // Generate WebSocket URL
-      const baseUrl = new URL(request.url).origin || "https://chess-multiplayer-worker.rohitvinod-dev.workers.dev";
-      const webSocketUrl = `${baseUrl}/party/gameroom/${roomId}`;
-
-      const accessToken = this.generateAccessToken(entry.playerId);
+      // Randomly assign colors
       const playerColor = Math.random() > 0.5 ? "white" : "black";
+      const opponentColor = playerColor === "white" ? "black" : "white";
 
+      // Generate access tokens for both players
+      const playerAccessToken = this.generateAccessToken(entry.playerId);
+      const opponentAccessToken = this.generateAccessToken(match.playerId);
+
+      // Generate WebSocket URL with query parameters (WebSockets don't support custom headers)
+      // Use the origin passed from the main worker, NOT request.url which is "https://internal"
+      const baseUrl = body.origin || "https://chess-multiplayer-worker.rohitvinod-dev.workers.dev";
+      // Convert HTTPS to WSS for WebSocket connections
+      const wsBaseUrl = baseUrl.replace(/^https:/, 'wss:').replace(/^http:/, 'ws:');
+
+      console.log(`Using base URL: ${baseUrl} -> WebSocket: ${wsBaseUrl}`);
+
+      // Create WebSocket URL for current player with their info as query params
+      const playerWsUrl = `${wsBaseUrl}/parties/GameRoom/${roomId}?` +
+        `playerId=${encodeURIComponent(entry.playerId)}` +
+        `&displayName=${encodeURIComponent(entry.displayName)}` +
+        `&rating=${entry.rating}` +
+        `&isProvisional=${entry.isProvisional}` +
+        `&color=${playerColor}`;
+
+      // Create WebSocket URL for opponent with their info as query params
+      const opponentWsUrl = `${wsBaseUrl}/parties/GameRoom/${roomId}?` +
+        `playerId=${encodeURIComponent(match.playerId)}` +
+        `&displayName=${encodeURIComponent(match.displayName)}` +
+        `&rating=${match.rating}` +
+        `&isProvisional=${match.isProvisional}` +
+        `&color=${opponentColor}`;
+
+      // CRITICAL FIX: Store pending match for the OPPONENT (who is still in queue and polling)
+      // This ensures when they poll next, they get the match info
+      const matchExpiresAt = now + (60 * 1000); // Expire in 60 seconds
+
+      const opponentPendingMatch: PendingMatch = {
+        roomId,
+        color: opponentColor,
+        opponentId: entry.playerId,
+        opponentDisplayName: entry.displayName,
+        opponentRating: entry.rating,
+        accessToken: opponentAccessToken,
+        webSocketUrl: opponentWsUrl,
+        createdAt: now,
+        expiresAt: matchExpiresAt,
+      };
+
+      this.pendingMatches.set(match.playerId, opponentPendingMatch);
+      await this.savePendingMatches();
+
+      console.log(`MatchmakingQueue: Created match ${roomId}`);
+      console.log(`  Player ${entry.playerId} gets color: ${playerColor} (immediate response)`);
+      console.log(`  Player ${match.playerId} gets color: ${opponentColor} (pending match stored)`);
+      console.log(`  Player WebSocket URL: ${playerWsUrl}`);
+      console.log(`  Opponent WebSocket URL: ${opponentWsUrl}`);
+
+      // Return match info to the current player (entry)
       return new Response(
         JSON.stringify({
           matched: true,
@@ -520,8 +688,8 @@ export class MatchmakingQueue {
           opponentId: match.playerId,
           opponentDisplayName: match.displayName,
           opponentRating: match.rating,
-          accessToken,
-          webSocketUrl,
+          accessToken: playerAccessToken,
+          webSocketUrl: playerWsUrl,
         }),
         { status: 200, headers: { "Content-Type": "application/json" } }
       );
@@ -554,7 +722,9 @@ export class MatchmakingQueue {
     }
 
     await this.loadQueue();
+    await this.loadPendingMatches();
     await this.cleanupExpiredEntries();
+    await this.cleanupExpiredPendingMatches();
 
     // Check if player is still in queue
     const entry = this.queue.find(e => e.playerId === playerId);
@@ -580,6 +750,7 @@ export class MatchmakingQueue {
       await this.saveQueue();
 
       const roomId = this.generateGameRoomId(playerId, match.playerId);
+      const now = Date.now();
 
       // Track game creation in stats
       try {
@@ -597,12 +768,54 @@ export class MatchmakingQueue {
         console.error("Failed to track game creation:", error);
       }
 
-      // Generate WebSocket URL
-      const baseUrl = new URL(request.url).origin || "https://chess-multiplayer-worker.rohitvinod-dev.workers.dev";
-      const webSocketUrl = `${baseUrl}/party/gameroom/${roomId}`;
-
-      const accessToken = this.generateAccessToken(playerId);
+      // Randomly assign colors
       const playerColor = Math.random() > 0.5 ? "white" : "black";
+      const opponentColor = playerColor === "white" ? "black" : "white";
+
+      // Generate access tokens for both players
+      const playerAccessToken = this.generateAccessToken(playerId);
+      const opponentAccessToken = this.generateAccessToken(match.playerId);
+
+      // Generate WebSocket URL with query parameters
+      // Use the origin passed from the main worker, NOT request.url which is "https://internal"
+      const baseUrl = entry.origin || "https://chess-multiplayer-worker.rohitvinod-dev.workers.dev";
+      // Convert HTTPS to WSS for WebSocket connections
+      const wsBaseUrl = baseUrl.replace(/^https:/, 'wss:').replace(/^http:/, 'ws:');
+
+      console.log(`Using base URL from entry: ${baseUrl} -> WebSocket: ${wsBaseUrl}`);
+
+      // Create WebSocket URL for current player with their info as query params
+      const playerWsUrl = `${wsBaseUrl}/parties/GameRoom/${roomId}?` +
+        `playerId=${encodeURIComponent(playerId)}` +
+        `&displayName=${encodeURIComponent(entry.displayName)}` +
+        `&rating=${entry.rating}` +
+        `&isProvisional=${entry.isProvisional}` +
+        `&color=${playerColor}`;
+
+      // Create WebSocket URL for opponent with their info as query params
+      const opponentWsUrl = `${wsBaseUrl}/parties/GameRoom/${roomId}?` +
+        `playerId=${encodeURIComponent(match.playerId)}` +
+        `&displayName=${encodeURIComponent(match.displayName)}` +
+        `&rating=${match.rating}` +
+        `&isProvisional=${match.isProvisional}` +
+        `&color=${opponentColor}`;
+
+      // Store pending match for opponent
+      const matchExpiresAt = now + (60 * 1000);
+      const opponentPendingMatch: PendingMatch = {
+        roomId,
+        color: opponentColor,
+        opponentId: playerId,
+        opponentDisplayName: entry.displayName,
+        opponentRating: entry.rating,
+        accessToken: opponentAccessToken,
+        webSocketUrl: opponentWsUrl,
+        createdAt: now,
+        expiresAt: matchExpiresAt,
+      };
+
+      this.pendingMatches.set(match.playerId, opponentPendingMatch);
+      await this.savePendingMatches();
 
       return new Response(JSON.stringify({
         inQueue: false,
@@ -612,8 +825,8 @@ export class MatchmakingQueue {
         opponentId: match.playerId,
         opponentDisplayName: match.displayName,
         opponentRating: match.rating,
-        accessToken,
-        webSocketUrl,
+        accessToken: playerAccessToken,
+        webSocketUrl: playerWsUrl,
       }), {
         status: 200,
         headers: { 'Content-Type': 'application/json' },

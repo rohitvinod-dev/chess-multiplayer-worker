@@ -81,22 +81,30 @@ export class GameRoom extends Server<GameRoomEnv> {
   }
 
   onConnect(connection: Connection, ctx: any) {
-    const playerId = ctx.request.headers.get("x-player-id");
-    const displayName = ctx.request.headers.get("x-display-name");
-    const rating = parseInt(ctx.request.headers.get("x-rating") || "1200");
-    const isProvisional =
-      ctx.request.headers.get("x-is-provisional") === "true";
+    // Read player info from query parameters (WebSockets don't support custom headers)
+    const url = new URL(ctx.request.url);
+    const playerId = url.searchParams.get("playerId");
+    const displayName = url.searchParams.get("displayName");
+    const rating = parseInt(url.searchParams.get("rating") || "1200");
+    const isProvisional = url.searchParams.get("isProvisional") === "true";
+    const colorFromUrl = url.searchParams.get("color") as PlayerColor | null;
 
     if (!playerId) {
+      console.error("GameRoom: Missing playerId in connection");
       connection.close(1002, "Missing player ID");
       return;
     }
+
+    console.log(`GameRoom: Player ${playerId} attempting to connect with color ${colorFromUrl}`);
 
     // Task 5: Check if this is a reconnection
     const existingPlayer = this.players.get(playerId);
     const isReconnection = existingPlayer && !existingPlayer.connected;
 
-    const playerColor = existingPlayer
+    // Use color from URL if provided (from matchmaking), otherwise assign based on order
+    const playerColor = colorFromUrl
+      ? colorFromUrl
+      : existingPlayer
       ? existingPlayer.color
       : this.players.size === 0 ? "white" : "black";
 
@@ -125,12 +133,16 @@ export class GameRoom extends Server<GameRoomEnv> {
     // Task 5 & 6: Send current game state to newly connected player
     this.sendGameStateToPlayer(playerId);
 
-    // If both players connected and both ready, ensure game is started
+    // If both players connected, auto-start the game
     if (this.players.size === 2 && !isReconnection) {
       const allConnected = Array.from(this.players.values()).every(p => p.connected);
-      if (allConnected && this.gameStatus === "waiting") {
-        this.gameStatus = "ready";
-        console.log("GameRoom: Both players connected, status changed to ready");
+      if (allConnected && (this.gameStatus === "waiting" || this.gameStatus === "ready")) {
+        console.log("GameRoom: Both players connected, auto-starting game");
+        // Set all players as ready and start the game
+        for (const player of this.players.values()) {
+          player.ready = true;
+        }
+        this.startGame();
       }
     }
 
