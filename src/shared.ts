@@ -71,9 +71,59 @@ export type Clock = {
   currentTurn: PlayerColor;
 };
 
+// ============ ELO RATING TYPES ============
+export type ELORatingChange = {
+  playerId: string;
+  oldRating: number;
+  newRating: number;
+  change: number; // +/- value
+  wasProvisional: boolean;
+  isProvisional: boolean; // after update
+};
+
+// ============ MATCH HISTORY TYPES ============
+export type MoveRecord = {
+  uci: string;
+  san?: string;
+  timestamp: number;
+  madeBy: PlayerColor;
+};
+
+export type MatchHistoryData = {
+  matchId: string;
+  whitePlayer: {
+    id: string;
+    displayName: string;
+    rating: number;
+    isProvisional: boolean;
+  };
+  blackPlayer: {
+    id: string;
+    displayName: string;
+    rating: number;
+    isProvisional: boolean;
+  };
+  gameMode: GameMode;
+  result: GameResult;
+  resultReason: string;
+  moves: MoveRecord[];
+  startedAt: number;
+  endedAt: number;
+  eloChanges: {
+    white: ELORatingChange;
+    black: ELORatingChange;
+  };
+};
+
 export type GameMessage =
   | {
       type: "ready";
+      state?: {
+        status: string;
+        version: number;
+        fen: string;
+        moves: Array<{ move: Move; timestamp: number }>;
+      };
       gameState: GameState;
       clock: Clock;
       playerInfo: PlayerInfo;
@@ -89,7 +139,12 @@ export type GameMessage =
     }
   | {
       type: "move";
-      move: Move;
+      record: {
+        uci: string;
+        madeBy: string;
+        fenAfter: string;
+      };
+      move?: Move;
       gameState: GameState;
       clock: Clock;
       stateVersion: number;
@@ -110,8 +165,9 @@ export type GameMessage =
     }
   | {
       type: "opponent_status";
-      connected: boolean;
-      lastSeen: number;
+      opponentConnected: boolean;
+      reconnectTimeout?: number;
+      timestamp: number;
     }
   | {
       type: "chat";
@@ -132,6 +188,16 @@ export type GameMessage =
     }
   | {
       type: "pong";
+    }
+  | {
+      type: "game_ended";
+      result: GameResult;
+      resultReason: string;
+      eloChanges: {
+        white: ELORatingChange;
+        black: ELORatingChange;
+      };
+      matchHistory: MatchHistoryData;
     };
 
 export const names = [

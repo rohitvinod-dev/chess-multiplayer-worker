@@ -36,7 +36,7 @@
       },
       {
         "class_name": "GameRoom",
-        "name": "GAME_ROOM"
+        "name": "GameRoom"
       },
       {
         "class_name": "MatchmakingQueue",

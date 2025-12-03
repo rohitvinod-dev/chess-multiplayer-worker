@@ -11,7 +11,7 @@ export { GameRoom } from "./game-room";
 // ============ TYPE DEFINITIONS ============
 export interface Env {
   Chat: DurableObjectNamespace;
-  GAME_ROOM: DurableObjectNamespace;
+  GameRoom: DurableObjectNamespace;
   MATCHMAKING_QUEUE: DurableObjectNamespace;
   STATS_TRACKER: DurableObjectNamespace;
   ASSETS: Fetcher;
@@ -182,6 +182,35 @@ export default {
   },
 } satisfies ExportedHandler<Env>;
 
+// ========== HELPER FUNCTIONS ==========
+function getCanonicalOrigin(requestUrl: string): string {
+  try {
+    const url = new URL(requestUrl);
+
+    // Handle internal Cloudflare routing or invalid hosts
+    if (url.hostname === 'internal' || url.hostname === 'localhost' || url.port === '0') {
+      return 'https://chess-multiplayer-worker.rohitvinod-dev.workers.dev';
+    }
+
+    // Remove default or invalid ports
+    const protocol = url.protocol;
+    const hostname = url.hostname;
+    const port = url.port;
+
+    if (port === '' || port === '0' ||
+        (protocol === 'https:' && port === '443') ||
+        (protocol === 'http:' && port === '80')) {
+      return `${protocol}//${hostname}`;
+    }
+
+    // Keep non-standard ports (for development)
+    return `${protocol}//${hostname}:${port}`;
+  } catch (e) {
+    console.error('Failed to parse request URL:', e);
+    return 'https://chess-multiplayer-worker.rohitvinod-dev.workers.dev';
+  }
+}
+
 // ========== MATCHMAKING HANDLER ==========
 async function handleMatchmake(
   request: Request,
@@ -222,7 +251,9 @@ async function handleMatchmake(
     const queueStub = queueNamespace.get(queueId);
 
     // Add player to queue - pass the real origin for WebSocket URL generation
-    const realOrigin = new URL(request.url).origin;
+    // Use sanitized origin to avoid port :0 from internal Cloudflare routing
+    const realOrigin = getCanonicalOrigin(request.url);
+    console.log('Extracted origin:', realOrigin, 'from request URL:', request.url);
     const response = await queueStub.fetch(
       new Request("https://internal/queue/join", {
         method: "POST",
@@ -500,6 +531,56 @@ export class MatchmakingQueue {
     return `game-${timestamp}-${random}`;
   }
 
+  private buildWebSocketUrl(origin: string, roomId: string, playerInfo: {
+    playerId: string;
+    displayName: string;
+    rating: number;
+    isProvisional: boolean;
+    color: string;
+  }): string {
+    let cleanOrigin = origin;
+
+    try {
+      const url = new URL(origin);
+
+      // Reject internal/invalid hostnames
+      if (url.hostname === 'internal' || url.hostname === 'localhost' || url.port === '0') {
+        cleanOrigin = 'https://chess-multiplayer-worker.rohitvinod-dev.workers.dev';
+      }
+
+      // Remove port if it's :0 or default
+      if (url.port === '0' || url.port === '443' || url.port === '80') {
+        cleanOrigin = `${url.protocol}//${url.hostname}`;
+      }
+    } catch (e) {
+      // If origin is malformed, use canonical URL
+      console.error('Invalid origin provided:', origin, e);
+      cleanOrigin = 'https://chess-multiplayer-worker.rohitvinod-dev.workers.dev';
+    }
+
+    // Convert to WebSocket protocol
+    const wsBaseUrl = cleanOrigin
+      .replace(/^https:/, 'wss:')
+      .replace(/^http:/, 'ws:');
+
+    // Construct full WebSocket URL with query parameters
+    // PartyServer converts binding names to kebab-case: GameRoom -> game-room
+    const wsUrl = `${wsBaseUrl}/parties/game-room/${roomId}?` +
+      `playerId=${encodeURIComponent(playerInfo.playerId)}` +
+      `&displayName=${encodeURIComponent(playerInfo.displayName)}` +
+      `&rating=${playerInfo.rating}` +
+      `&isProvisional=${playerInfo.isProvisional}` +
+      `&color=${playerInfo.color}`;
+
+    // Final validation: ensure URL doesn't contain :0
+    if (wsUrl.includes(':0/') || wsUrl.includes(':0?')) {
+      throw new Error(`Invalid WebSocket URL generated: ${wsUrl}`);
+    }
+
+    console.log(`Generated WebSocket URL: ${wsUrl}`);
+    return wsUrl;
+  }
+
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
@@ -630,29 +711,30 @@ export class MatchmakingQueue {
       const playerAccessToken = this.generateAccessToken(entry.playerId);
       const opponentAccessToken = this.generateAccessToken(match.playerId);
 
-      // Generate WebSocket URL with query parameters (WebSockets don't support custom headers)
-      // Use the origin passed from the main worker, NOT request.url which is "https://internal"
-      const baseUrl = body.origin || "https://chess-multiplayer-worker.rohitvinod-dev.workers.dev";
-      // Convert HTTPS to WSS for WebSocket connections
-      const wsBaseUrl = baseUrl.replace(/^https:/, 'wss:').replace(/^http:/, 'ws:');
+      // Generate WebSocket URLs using sanitized origin
+      const playerWsUrl = this.buildWebSocketUrl(
+        body.origin || "https://chess-multiplayer-worker.rohitvinod-dev.workers.dev",
+        roomId,
+        {
+          playerId: entry.playerId,
+          displayName: entry.displayName,
+          rating: entry.rating,
+          isProvisional: entry.isProvisional,
+          color: playerColor,
+        }
+      );
 
-      console.log(`Using base URL: ${baseUrl} -> WebSocket: ${wsBaseUrl}`);
-
-      // Create WebSocket URL for current player with their info as query params
-      const playerWsUrl = `${wsBaseUrl}/parties/GameRoom/${roomId}?` +
-        `playerId=${encodeURIComponent(entry.playerId)}` +
-        `&displayName=${encodeURIComponent(entry.displayName)}` +
-        `&rating=${entry.rating}` +
-        `&isProvisional=${entry.isProvisional}` +
-        `&color=${playerColor}`;
-
-      // Create WebSocket URL for opponent with their info as query params
-      const opponentWsUrl = `${wsBaseUrl}/parties/GameRoom/${roomId}?` +
-        `playerId=${encodeURIComponent(match.playerId)}` +
-        `&displayName=${encodeURIComponent(match.displayName)}` +
-        `&rating=${match.rating}` +
-        `&isProvisional=${match.isProvisional}` +
-        `&color=${opponentColor}`;
+      const opponentWsUrl = this.buildWebSocketUrl(
+        body.origin || "https://chess-multiplayer-worker.rohitvinod-dev.workers.dev",
+        roomId,
+        {
+          playerId: match.playerId,
+          displayName: match.displayName,
+          rating: match.rating,
+          isProvisional: match.isProvisional,
+          color: opponentColor,
+        }
+      );
 
       // CRITICAL FIX: Store pending match for the OPPONENT (who is still in queue and polling)
       // This ensures when they poll next, they get the match info
@@ -776,29 +858,30 @@ export class MatchmakingQueue {
       const playerAccessToken = this.generateAccessToken(playerId);
       const opponentAccessToken = this.generateAccessToken(match.playerId);
 
-      // Generate WebSocket URL with query parameters
-      // Use the origin passed from the main worker, NOT request.url which is "https://internal"
-      const baseUrl = entry.origin || "https://chess-multiplayer-worker.rohitvinod-dev.workers.dev";
-      // Convert HTTPS to WSS for WebSocket connections
-      const wsBaseUrl = baseUrl.replace(/^https:/, 'wss:').replace(/^http:/, 'ws:');
+      // Generate WebSocket URLs using sanitized origin
+      const playerWsUrl = this.buildWebSocketUrl(
+        entry.origin || "https://chess-multiplayer-worker.rohitvinod-dev.workers.dev",
+        roomId,
+        {
+          playerId: playerId,
+          displayName: entry.displayName,
+          rating: entry.rating,
+          isProvisional: entry.isProvisional,
+          color: playerColor,
+        }
+      );
 
-      console.log(`Using base URL from entry: ${baseUrl} -> WebSocket: ${wsBaseUrl}`);
-
-      // Create WebSocket URL for current player with their info as query params
-      const playerWsUrl = `${wsBaseUrl}/parties/GameRoom/${roomId}?` +
-        `playerId=${encodeURIComponent(playerId)}` +
-        `&displayName=${encodeURIComponent(entry.displayName)}` +
-        `&rating=${entry.rating}` +
-        `&isProvisional=${entry.isProvisional}` +
-        `&color=${playerColor}`;
-
-      // Create WebSocket URL for opponent with their info as query params
-      const opponentWsUrl = `${wsBaseUrl}/parties/GameRoom/${roomId}?` +
-        `playerId=${encodeURIComponent(match.playerId)}` +
-        `&displayName=${encodeURIComponent(match.displayName)}` +
-        `&rating=${match.rating}` +
-        `&isProvisional=${match.isProvisional}` +
-        `&color=${opponentColor}`;
+      const opponentWsUrl = this.buildWebSocketUrl(
+        entry.origin || "https://chess-multiplayer-worker.rohitvinod-dev.workers.dev",
+        roomId,
+        {
+          playerId: match.playerId,
+          displayName: match.displayName,
+          rating: match.rating,
+          isProvisional: match.isProvisional,
+          color: opponentColor,
+        }
+      );
 
       // Store pending match for opponent
       const matchExpiresAt = now + (60 * 1000);

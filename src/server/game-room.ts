@@ -13,6 +13,9 @@ import type {
   PlayerInfo,
   Clock,
   GameMessage,
+  ELORatingChange,
+  MoveRecord,
+  MatchHistoryData,
 } from "../shared";
 
 interface PlayerSession {
@@ -34,7 +37,7 @@ const RECONNECT_TIMEOUT_MS = 10000; // 10 seconds to reconnect before abandonmen
 
 // Define Env type for GameRoom
 interface GameRoomEnv {
-  GAME_ROOM: DurableObjectNamespace;
+  GameRoom: DurableObjectNamespace;
   MATCHMAKING_QUEUE: DurableObjectNamespace;
   ASSETS: Fetcher;
 }
@@ -62,6 +65,10 @@ export class GameRoom extends Server<GameRoomEnv> {
     lastUpdate: Date.now(),
     currentTurn: "white",
   };
+
+  // Match history tracking
+  matchStartTime?: number;
+  moveHistory: MoveRecord[] = [];
 
   // Timers
   clockIntervalId?: number;
@@ -133,11 +140,11 @@ export class GameRoom extends Server<GameRoomEnv> {
     // Task 5 & 6: Send current game state to newly connected player
     this.sendGameStateToPlayer(playerId);
 
-    // If both players connected, auto-start the game
-    if (this.players.size === 2 && !isReconnection) {
+    // If both players connected, auto-start the game (works for both initial and reconnections)
+    if (this.players.size === 2) {
       const allConnected = Array.from(this.players.values()).every(p => p.connected);
       if (allConnected && (this.gameStatus === "waiting" || this.gameStatus === "ready")) {
-        console.log("GameRoom: Both players connected, auto-starting game");
+        console.log("GameRoom: Both players connected, auto-starting game (reconnection: " + isReconnection + ")");
         // Set all players as ready and start the game
         for (const player of this.players.values()) {
           player.ready = true;
@@ -200,7 +207,7 @@ export class GameRoom extends Server<GameRoomEnv> {
 
       switch (gameMessage.type) {
         case "move":
-          this.handleMove(sendingPlayer, (gameMessage as any).move);
+          this.handleMove(sendingPlayer, data);
           break;
         case "resign":
           this.handleResign(sendingPlayer);
@@ -262,6 +269,10 @@ export class GameRoom extends Server<GameRoomEnv> {
     // Set clock based on game mode
     this.setClock(this.gameMode);
 
+    // Initialize match tracking
+    this.matchStartTime = Date.now();
+    this.moveHistory = [];
+
     // Start clock interval
     this.startClockInterval();
 
@@ -274,9 +285,36 @@ export class GameRoom extends Server<GameRoomEnv> {
     this.sendReadyMessage(black, white);
 
     this.gameStatus = "playing";
+    console.log(`GameRoom: Game started at ${this.matchStartTime}`);
   }
 
-  private handleMove(player: PlayerSession, move: Move) {
+  private handleMove(player: PlayerSession, data: any) {
+    const messageId = data.messageId;
+    const uciMove = data.move as string; // UCI format: "e2e4" or "e7e8q"
+    const fenAfter = data.fenAfter as string | undefined;
+
+    // Parse UCI move into Move object
+    let move: Move;
+    try {
+      if (uciMove.length < 4) {
+        throw new Error("Invalid UCI move length");
+      }
+      move = {
+        from: uciMove.substring(0, 2),
+        to: uciMove.substring(2, 4),
+        promotion: uciMove.length > 4 ? uciMove.substring(4) : undefined,
+      };
+    } catch (e) {
+      player.connection?.send(
+        JSON.stringify({
+          type: "error",
+          code: "invalid_move_format",
+          message: "Invalid move format",
+        } as GameMessage)
+      );
+      return;
+    }
+
     if (this.gameStatus !== "playing") {
       player.connection?.send(
         JSON.stringify({
@@ -302,16 +340,28 @@ export class GameRoom extends Server<GameRoomEnv> {
     }
 
     // Add move to game state
+    const moveTimestamp = Date.now();
     this.gameState.moves.push({
       move,
-      timestamp: Date.now(),
+      timestamp: moveTimestamp,
+    });
+
+    // Record move in match history with SAN
+    this.moveHistory.push({
+      uci: uciMove,
+      san: data.san as string | undefined,
+      timestamp: moveTimestamp,
+      madeBy: player.color,
     });
 
     this.stateVersion++;
 
-    // Update FEN (simplified - just update turn for now)
-    const lastMoveIndex = this.gameState.moves.length - 1;
-    this.gameState.fen = this.updateFen(move, isWhiteTurn);
+    // Update FEN - use client's FEN if provided, otherwise use simple update
+    if (fenAfter) {
+      this.gameState.fen = fenAfter;
+    } else {
+      this.gameState.fen = this.updateFen(move, isWhiteTurn);
+    }
 
     // Switch turn
     this.clock.currentTurn = isWhiteTurn ? "black" : "white";
@@ -327,18 +377,36 @@ export class GameRoom extends Server<GameRoomEnv> {
     // Save state
     this.saveGameState();
 
-    // Send move to both players
-    const moveMessage: GameMessage = {
+    // Send ACK to the player who made the move
+    if (messageId && player.connection) {
+      player.connection.send(
+        JSON.stringify({
+          type: "ack",
+          messageId,
+          success: true,
+          stateVersion: this.stateVersion,
+        })
+      );
+    }
+
+    // Broadcast move to both players
+    const moveMessage = {
       type: "move",
-      move,
+      record: {
+        uci: uciMove,
+        madeBy: player.color,
+        fenAfter: this.gameState.fen,
+      },
       gameState: this.gameState,
       clock: this.clock,
       stateVersion: this.stateVersion,
     };
 
+    console.log(`GameRoom: Broadcasting move ${uciMove} by ${player.color} to ${this.players.size} players`);
     for (const p of this.players.values()) {
       if (p.connected && p.connection) {
         p.connection.send(JSON.stringify(moveMessage));
+        console.log(`GameRoom: Sent move to player ${p.id} (${p.color})`);
       }
     }
 
@@ -357,12 +425,15 @@ export class GameRoom extends Server<GameRoomEnv> {
   private handleChat(player: PlayerSession, message: string) {
     const chatMessage: GameMessage = {
       type: "chat",
-      playerId: player.id,
+      playerId: player.color, // Send color instead of ID for easier identification
       displayName: player.displayName,
       message: message.slice(0, 500), // Limit message length
       timestamp: Date.now(),
     };
 
+    console.log(`GameRoom: Chat from ${player.displayName} (${player.color}): ${message.slice(0, 50)}`);
+
+    // Broadcast to both players
     for (const p of this.players.values()) {
       if (p.connected && p.connection) {
         p.connection.send(JSON.stringify(chatMessage));
@@ -436,6 +507,32 @@ export class GameRoom extends Server<GameRoomEnv> {
     // For now, just allow the game to continue until resignation or timeout
   }
 
+  private calculateELO(
+    winnerRating: number,
+    loserRating: number,
+    winnerProvisional: boolean,
+    loserProvisional: boolean,
+    isDraw: boolean = false
+  ): { winnerChange: number; loserChange: number } {
+    // K-factor: 40 for provisional players (first 20 games), 20 for established players
+    const winnerK = winnerProvisional ? 40 : 20;
+    const loserK = loserProvisional ? 40 : 20;
+
+    // Expected score calculation (Elo formula)
+    const expectedWinner = 1 / (1 + Math.pow(10, (loserRating - winnerRating) / 400));
+    const expectedLoser = 1 / (1 + Math.pow(10, (winnerRating - loserRating) / 400));
+
+    // Actual score: 1 for win, 0.5 for draw, 0 for loss
+    const winnerScore = isDraw ? 0.5 : 1;
+    const loserScore = isDraw ? 0.5 : 0;
+
+    // Calculate rating changes
+    const winnerChange = Math.round(winnerK * (winnerScore - expectedWinner));
+    const loserChange = Math.round(loserK * (loserScore - expectedLoser));
+
+    return { winnerChange, loserChange };
+  }
+
   private endGame(result: string, reason: string) {
     if (this.gameStatus === "finished") return;
 
@@ -452,8 +549,122 @@ export class GameRoom extends Server<GameRoomEnv> {
     // Save final state
     this.saveGameState();
 
-    // Notify players
-    const endMessage: GameMessage = {
+    // Get players
+    const players = Array.from(this.players.values());
+    const white = players.find(p => p.color === "white");
+    const black = players.find(p => p.color === "black");
+
+    if (!white || !black) {
+      console.error("GameRoom: Cannot calculate ELO - missing players");
+      return;
+    }
+
+    // Calculate ELO changes
+    let whiteChange = 0;
+    let blackChange = 0;
+
+    if (result === "white_win") {
+      const changes = this.calculateELO(
+        white.rating,
+        black.rating,
+        white.isProvisional,
+        black.isProvisional,
+        false
+      );
+      whiteChange = changes.winnerChange;
+      blackChange = changes.loserChange;
+    } else if (result === "black_win") {
+      const changes = this.calculateELO(
+        black.rating,
+        white.rating,
+        black.isProvisional,
+        white.isProvisional,
+        false
+      );
+      blackChange = changes.winnerChange;
+      whiteChange = changes.loserChange;
+    } else if (result === "draw") {
+      const changes = this.calculateELO(
+        white.rating,
+        black.rating,
+        white.isProvisional,
+        black.isProvisional,
+        true
+      );
+      whiteChange = changes.winnerChange;
+      blackChange = changes.loserChange;
+    }
+
+    // Create ELO rating change objects
+    const whiteRatingChange: ELORatingChange = {
+      playerId: white.id,
+      oldRating: white.rating,
+      newRating: white.rating + whiteChange,
+      change: whiteChange,
+      wasProvisional: white.isProvisional,
+      // Provisional status ends after 20 games (approx. 20 moves recorded means complete game)
+      isProvisional: white.isProvisional && this.moveHistory.length < 20,
+    };
+
+    const blackRatingChange: ELORatingChange = {
+      playerId: black.id,
+      oldRating: black.rating,
+      newRating: black.rating + blackChange,
+      change: blackChange,
+      wasProvisional: black.isProvisional,
+      isProvisional: black.isProvisional && this.moveHistory.length < 20,
+    };
+
+    // Create match history data
+    const matchHistory: MatchHistoryData = {
+      matchId: this.party.id,
+      whitePlayer: {
+        id: white.id,
+        displayName: white.displayName,
+        rating: white.rating,
+        isProvisional: white.isProvisional,
+      },
+      blackPlayer: {
+        id: black.id,
+        displayName: black.displayName,
+        rating: black.rating,
+        isProvisional: black.isProvisional,
+      },
+      gameMode: this.gameMode,
+      result: result as any,
+      resultReason: reason,
+      moves: this.moveHistory,
+      startedAt: this.matchStartTime || Date.now(),
+      endedAt: Date.now(),
+      eloChanges: {
+        white: whiteRatingChange,
+        black: blackRatingChange,
+      },
+    };
+
+    console.log(`GameRoom: Match ended - White: ${whiteChange >= 0 ? '+' : ''}${whiteChange}, Black: ${blackChange >= 0 ? '+' : ''}${blackChange}`);
+    console.log(`GameRoom: ${this.moveHistory.length} moves recorded`);
+
+    // Send game_ended message with ELO changes and match history to both players
+    const gameEndedMessage: GameMessage = {
+      type: "game_ended",
+      result: result as any,
+      resultReason: reason,
+      eloChanges: {
+        white: whiteRatingChange,
+        black: blackRatingChange,
+      },
+      matchHistory,
+    };
+
+    for (const p of this.players.values()) {
+      if (p.connected && p.connection) {
+        p.connection.send(JSON.stringify(gameEndedMessage));
+      }
+    }
+
+    // Also send legacy system message for backward compatibility
+    const systemMessage: GameMessage = {
       type: "system",
       message: `Game ended: ${result} (${reason})`,
       code: "game_ended",
@@ -461,20 +672,7 @@ export class GameRoom extends Server<GameRoomEnv> {
 
     for (const p of this.players.values()) {
       if (p.connected && p.connection) {
-        p.connection.send(JSON.stringify(endMessage));
-      }
-    }
-
-    // Send game state with result to both players
-    const finalStateMessage: GameMessage = {
-      type: "state",
-      gameState: this.gameState,
-      stateVersion: this.stateVersion,
-    };
-
-    for (const p of this.players.values()) {
-      if (p.connected && p.connection) {
-        p.connection.send(JSON.stringify(finalStateMessage));
+        p.connection.send(JSON.stringify(systemMessage));
       }
     }
   }
@@ -487,6 +685,12 @@ export class GameRoom extends Server<GameRoomEnv> {
 
     const readyMessage: GameMessage = {
       type: "ready",
+      state: {
+        status: this.gameStatus,
+        version: this.stateVersion,
+        fen: this.gameState.fen,
+        moves: this.gameState.moves,
+      },
       gameState: this.gameState,
       clock: this.clock,
       playerInfo: {
@@ -578,8 +782,8 @@ export class GameRoom extends Server<GameRoomEnv> {
       if (id !== playerId && player.connected && player.connection) {
         try {
           player.connection.send(JSON.stringify({
-            type: "opponent_connected",
-            playerId,
+            type: "opponent_status",
+            opponentConnected: true,
             timestamp: Date.now(),
           }));
           console.log(`GameRoom: Notified ${id} that ${playerId} connected`);
@@ -596,8 +800,8 @@ export class GameRoom extends Server<GameRoomEnv> {
       if (id !== playerId && player.connected && player.connection) {
         try {
           player.connection.send(JSON.stringify({
-            type: "opponent_disconnected",
-            playerId,
+            type: "opponent_status",
+            opponentConnected: false,
             reconnectTimeout: RECONNECT_TIMEOUT_MS,
             timestamp: Date.now(),
           }));
