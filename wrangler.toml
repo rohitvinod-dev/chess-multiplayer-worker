@@ -1,0 +1,147 @@
+name = "checkmatex-worker"
+main = "src/index.ts"
+compatibility_date = "2025-10-08"
+compatibility_flags = ["nodejs_compat"]
+
+# Durable Objects Bindings
+[durable_objects]
+bindings = [
+  { name = "GAME_ROOM", class_name = "GameRoom" },
+  { name = "CHAT", class_name = "Chat" },
+  { name = "MATCHMAKING_QUEUE", class_name = "MatchmakingQueue" },
+  { name = "STATS_TRACKER", class_name = "StatsTracker" },
+  { name = "USER_PROFILE", class_name = "UserProfile" },
+  { name = "LOBBY_LIST", class_name = "LobbyList" },
+  { name = "LOBBY_ROOM", class_name = "LobbyRoom" }
+]
+
+# Migrations for Durable Objects
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Chat"]
+
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = ["MatchmakingQueue", "GameRoom"]
+
+[[migrations]]
+tag = "v4"
+new_sqlite_classes = ["StatsTracker"]
+
+[[migrations]]
+tag = "v5"
+new_sqlite_classes = ["UserProfile"]
+
+[[migrations]]
+tag = "v6"
+new_sqlite_classes = ["LobbyList"]
+
+# Static Assets
+[assets]
+directory = "./public"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+
+# Build Configuration
+[build]
+command = "esbuild src/client/index.tsx --bundle --splitting --format=esm --platform=browser --outdir=public/dist"
+
+# Observability
+[observability]
+enabled = true
+
+# Environment Variables (non-secret)
+[vars]
+FIREBASE_PROJECT_ID = "openings-trainer"
+ENVIRONMENT = "development"
+
+# Production Environment
+[env.production]
+name = "checkmatex-worker-production"
+vars = { FIREBASE_PROJECT_ID = "openings-trainer", ENVIRONMENT = "production" }
+
+[env.production.durable_objects]
+bindings = [
+  { name = "GAME_ROOM", class_name = "GameRoom" },
+  { name = "CHAT", class_name = "Chat" },
+  { name = "MATCHMAKING_QUEUE", class_name = "MatchmakingQueue" },
+  { name = "STATS_TRACKER", class_name = "StatsTracker" },
+  { name = "USER_PROFILE", class_name = "UserProfile" },
+  { name = "LOBBY_LIST", class_name = "LobbyList" },
+  { name = "LOBBY_ROOM", class_name = "LobbyRoom" }
+]
+
+# Production Queue Bindings (requires paid plan - disabled for now)
+# [[env.production.queues.producers]]
+# queue = "leaderboard-cleanup-queue"
+# binding = "CLEANUP_QUEUE"
+
+# [[env.production.queues.producers]]
+# queue = "streak-reminders-queue"
+# binding = "REMINDERS_QUEUE"
+
+# [[env.production.queues.producers]]
+# queue = "last-chance-queue"
+# binding = "LAST_CHANCE_QUEUE"
+
+# Staging Environment
+[env.staging]
+name = "checkmatex-worker-staging"
+vars = { FIREBASE_PROJECT_ID = "openings-trainer", ENVIRONMENT = "staging" }
+
+# Cron Triggers (Phase 5)
+# NOTE: Free plan has limit of 5 cron triggers total across all workers
+# Temporarily disabled - can be enabled with paid plan or manually triggered
+# [triggers]
+# crons = [
+#   "0 2 * * *",   # Daily cleanup at 2 AM UTC - Remove deleted users from leaderboards
+#   "0 9 * * *",   # Daily streak reminders at 9 AM UTC - Send training reminders
+#   "0 21 * * *"   # Last chance reminders at 9 PM UTC - Save streaks before midnight
+# ]
+
+# Queues Configuration (Phase 5 - Scalable Cron Jobs)
+# NOTE: Queues require Cloudflare Workers Paid plan - disabled for now
+# Cron jobs will run without queue-based batching until plan upgrade
+
+# # Leaderboard Cleanup Queue
+# [[queues.producers]]
+# queue = "leaderboard-cleanup-queue"
+# binding = "CLEANUP_QUEUE"
+
+# [[queues.consumers]]
+# queue = "leaderboard-cleanup-queue"
+# max_batch_size = 100          # Process 100 leaderboard entries per batch
+# max_retries = 3               # Retry failed batches up to 3 times
+# max_batch_timeout = 30        # 30 seconds timeout per batch
+# max_concurrency = 10          # Process 10 batches in parallel
+# dead_letter_queue = "cleanup-dlq"
+
+# # Daily Streak Reminders Queue
+# [[queues.producers]]
+# queue = "streak-reminders-queue"
+# binding = "REMINDERS_QUEUE"
+
+# [[queues.consumers]]
+# queue = "streak-reminders-queue"
+# max_batch_size = 100          # Process 100 users per batch
+# max_retries = 3
+# max_batch_timeout = 60        # 60 seconds for notification sending
+# max_concurrency = 20          # 20 batches in parallel (up to 2,000 users/min)
+# dead_letter_queue = "reminders-dlq"
+
+# # Last-Chance Streak Savers Queue
+# [[queues.producers]]
+# queue = "last-chance-queue"
+# binding = "LAST_CHANCE_QUEUE"
+
+# [[queues.consumers]]
+# queue = "last-chance-queue"
+# max_batch_size = 100          # Process 100 users per batch
+# max_retries = 3
+# max_batch_timeout = 60        # 60 seconds for notification sending
+# max_concurrency = 20          # 20 batches in parallel
+# dead_letter_queue = "last-chance-dlq"
+
+[[migrations]]
+tag = "v7"
+new_sqlite_classes = ["LobbyRoom"]

@@ -1,0 +1,1289 @@
+import { authenticateRequest } from './auth';
+import { FirestoreClient } from './firestore';
+import { handleMatchResult } from './endpoints/multiplayer/match-result';
+import { handleRecordProgress } from './endpoints/progress/record';
+import { handleClaimEnergyReward } from './endpoints/progress/energy';
+import { handleEnsureUserProfile } from './endpoints/users/profile';
+import { handleRegisterDevice } from './endpoints/users/device';
+import { handleEnqueueNotification } from './endpoints/notifications/enqueue';
+import { handleUpdateNotificationPreferences } from './endpoints/notifications/preferences';
+import { handleTrackNotificationOpened } from './endpoints/notifications/track';
+import { handleManageOpenings } from './endpoints/openings/manage';
+import { handleSyncAchievements } from './endpoints/achievements/sync';
+import { createLobbyHandler } from './endpoints/lobby/create';
+import { listLobbiesHandler } from './endpoints/lobby/list';
+import { joinLobbyHandler } from './endpoints/lobby/join';
+import { spectateLobbyHandler } from './endpoints/lobby/spectate';
+import { deleteLobbyHandler } from './endpoints/lobby/delete';
+
+// Queue-based cron jobs (SCALABLE - supports millions of users!)
+import { enqueueLeaderboardCleanup, processCleanupBatch } from './cron/cleanup-leaderboards-queue';
+import { enqueueStreakReminders, processRemindersBatch } from './cron/daily-reminders-queue';
+import { enqueueLastChanceReminders, processLastChanceBatch } from './cron/last-chance-queue';
+import {
+  type Connection,
+  Server,
+  type WSMessage,
+  routePartykitRequest,
+} from "partyserver";
+import type { ChatMessage, Message, GameMode } from "./shared";
+
+// Export Durable Objects
+export { GameRoom } from './durable-objects/game-room';
+export { UserProfile } from './durable-objects/user-profile';
+export { LobbyList } from './durable-objects/lobby-list';
+export { LobbyRoom } from './durable-objects/lobby-room';
+
+// Environment interface
+export interface Env {
+  // Durable Objects
+  GAME_ROOM: DurableObjectNamespace;
+  CHAT: DurableObjectNamespace;
+  MATCHMAKING_QUEUE: DurableObjectNamespace;
+  STATS_TRACKER: DurableObjectNamespace;
+  USER_PROFILE: DurableObjectNamespace;
+  NOTIFICATION_SCHEDULER: DurableObjectNamespace;
+  LOBBY_LIST: DurableObjectNamespace;
+  LOBBY_ROOM: DurableObjectNamespace;
+
+  // Secrets & Environment Variables
+  FIREBASE_SERVICE_ACCOUNT: string;
+  FIREBASE_PROJECT_ID: string;
+  ENVIRONMENT: string;
+
+  // Cloudflare Queues (Phase 5 - Scalable Cron Jobs)
+  CLEANUP_QUEUE: Queue;
+  REMINDERS_QUEUE: Queue;
+  LAST_CHANCE_QUEUE: Queue;
+
+  // Assets (static files)
+  ASSETS: Fetcher;
+}
+
+// ============ CHAT ROOM (from old index.ts) ============
+export class Chat extends Server<Env> {
+  static options = { hibernate: true };
+
+  messages = [] as ChatMessage[];
+
+  broadcastMessage(message: Message, exclude?: string[]) {
+    this.broadcast(JSON.stringify(message), exclude);
+  }
+
+  onStart() {
+    // create the messages table if it doesn't exist
+    this.ctx.storage.sql.exec(
+      `CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, user TEXT, role TEXT, content TEXT)`,
+    );
+
+    // load the messages from the database
+    this.messages = this.ctx.storage.sql
+      .exec(`SELECT * FROM messages`)
+      .toArray() as ChatMessage[];
+  }
+
+  onConnect(connection: Connection) {
+    connection.send(
+      JSON.stringify({
+        type: "all",
+        messages: this.messages,
+      } satisfies Message),
+    );
+  }
+
+  saveMessage(message: ChatMessage) {
+    const existingMessage = this.messages.find((m) => m.id === message.id);
+    if (existingMessage) {
+      this.messages = this.messages.map((m) => {
+        if (m.id === message.id) {
+          return message;
+        }
+        return m;
+      });
+    } else {
+      this.messages.push(message);
+    }
+
+    this.ctx.storage.sql.exec(
+      `INSERT INTO messages (id, user, role, content) VALUES ('${
+        message.id
+      }', '${message.user}', '${message.role}', ${JSON.stringify(
+        message.content,
+      )}) ON CONFLICT (id) DO UPDATE SET content = ${JSON.stringify(
+        message.content,
+      )}`,
+    );
+  }
+
+  onMessage(connection: Connection, message: WSMessage) {
+    this.broadcast(message);
+
+    const parsed = JSON.parse(message as string) as Message;
+    if (parsed.type === "add" || parsed.type === "update") {
+      this.saveMessage(parsed);
+    }
+  }
+}
+
+// ============ MATCHMAKING QUEUE (from old index.ts) ============
+const MATCHMAKING_TIMEOUT_SECONDS = 30;
+
+interface QueueEntry {
+  playerId: string;
+  displayName: string;
+  rating: number;
+  isProvisional: boolean;
+  gameMode: GameMode;
+  joinedAt: number;
+  minRating: number;
+  maxRating: number;
+  expiresAt: number;
+  origin?: string;
+}
+
+interface PendingMatch {
+  roomId: string;
+  color: string;
+  opponentId: string;
+  opponentDisplayName: string;
+  opponentRating: number;
+  accessToken: string;
+  webSocketUrl: string;
+  createdAt: number;
+  expiresAt: number;
+}
+
+export class MatchmakingQueue {
+  private state: DurableObjectState;
+  private env: Env;
+  private queue: QueueEntry[] = [];
+  private queueLoaded: boolean = false;
+  private pendingMatches: Map<string, PendingMatch> = new Map();
+  private pendingMatchesLoaded: boolean = false;
+
+  constructor(state: DurableObjectState, env: Env) {
+    this.state = state;
+    this.env = env;
+    this.queue = [];
+    this.pendingMatches = new Map();
+  }
+
+  private async loadQueue(): Promise<void> {
+    if (this.queueLoaded) return;
+
+    const stored = await this.state.storage.get<QueueEntry[]>('queue');
+    if (stored) {
+      const now = Date.now();
+      this.queue = stored.filter(entry => entry.expiresAt > now);
+    } else {
+      this.queue = [];
+    }
+
+    this.queueLoaded = true;
+    console.log(`MatchmakingQueue: Loaded ${this.queue.length} entries from storage`);
+  }
+
+  private async saveQueue(): Promise<void> {
+    await this.state.storage.put('queue', this.queue);
+    console.log(`MatchmakingQueue: Saved ${this.queue.length} entries to storage`);
+  }
+
+  private async loadPendingMatches(): Promise<void> {
+    if (this.pendingMatchesLoaded) return;
+
+    const stored = await this.state.storage.get<Array<[string, PendingMatch]>>('pendingMatches');
+    if (stored) {
+      const now = Date.now();
+      this.pendingMatches = new Map(
+        stored.filter(([_, match]) => match.expiresAt > now)
+      );
+    } else {
+      this.pendingMatches = new Map();
+    }
+
+    this.pendingMatchesLoaded = true;
+    console.log(`MatchmakingQueue: Loaded ${this.pendingMatches.size} pending matches from storage`);
+  }
+
+  private async savePendingMatches(): Promise<void> {
+    await this.state.storage.put('pendingMatches', Array.from(this.pendingMatches.entries()));
+    console.log(`MatchmakingQueue: Saved ${this.pendingMatches.size} pending matches to storage`);
+  }
+
+  private async cleanupExpiredPendingMatches(): Promise<void> {
+    const now = Date.now();
+    const initialCount = this.pendingMatches.size;
+
+    for (const [playerId, match] of this.pendingMatches.entries()) {
+      if (match.expiresAt <= now) {
+        this.pendingMatches.delete(playerId);
+      }
+    }
+
+    const removedCount = initialCount - this.pendingMatches.size;
+    if (removedCount > 0) {
+      console.log(`MatchmakingQueue: Cleaned up ${removedCount} expired pending matches`);
+      await this.savePendingMatches();
+    }
+  }
+
+  private calculateRatingRange(entry: QueueEntry): { min: number; max: number } {
+    const waitTimeSeconds = (Date.now() - entry.joinedAt) / 1000;
+
+    let range: number;
+
+    if (waitTimeSeconds < 10) {
+      range = 150;
+    } else if (waitTimeSeconds < 20) {
+      range = 150 + ((waitTimeSeconds - 10) * 10);
+    } else if (waitTimeSeconds < 25) {
+      range = 250 + ((waitTimeSeconds - 20) * 30);
+    } else {
+      range = 400 + ((waitTimeSeconds - 25) * 40);
+    }
+
+    const cappedRange = Math.min(range, 600);
+
+    return {
+      min: entry.rating - cappedRange,
+      max: entry.rating + cappedRange,
+    };
+  }
+
+  private findMatch(entry: QueueEntry): QueueEntry | null {
+    const entryRange = this.calculateRatingRange(entry);
+    entry.minRating = entryRange.min;
+    entry.maxRating = entryRange.max;
+
+    for (const opponent of this.queue) {
+      if (opponent.gameMode !== entry.gameMode) continue;
+      if (opponent.playerId === entry.playerId) continue;
+
+      const opponentRange = this.calculateRatingRange(opponent);
+      opponent.minRating = opponentRange.min;
+      opponent.maxRating = opponentRange.max;
+
+      const entryAcceptsOpponent =
+        opponent.rating >= entry.minRating &&
+        opponent.rating <= entry.maxRating;
+
+      const opponentAcceptsEntry =
+        entry.rating >= opponent.minRating &&
+        entry.rating <= opponent.maxRating;
+
+      if (entryAcceptsOpponent && opponentAcceptsEntry) {
+        console.log(`MatchmakingQueue: Match found!`);
+        return opponent;
+      }
+    }
+
+    return null;
+  }
+
+  private async cleanupExpiredEntries(): Promise<void> {
+    const now = Date.now();
+    const initialCount = this.queue.length;
+
+    this.queue = this.queue.filter(entry => entry.expiresAt > now);
+
+    const removedCount = initialCount - this.queue.length;
+    if (removedCount > 0) {
+      console.log(`MatchmakingQueue: Cleaned up ${removedCount} expired entries`);
+      await this.saveQueue();
+    }
+  }
+
+  private generateGameRoomId(player1: string, player2: string): string {
+    const timestamp = Date.now().toString(36);
+    const random = Math.random().toString(36).slice(2, 9);
+    return `game-${timestamp}-${random}`;
+  }
+
+  private buildWebSocketUrl(origin: string, roomId: string, playerInfo: {
+    playerId: string;
+    displayName: string;
+    rating: number;
+    isProvisional: boolean;
+    color: string;
+  }): string {
+    let cleanOrigin = origin;
+
+    try {
+      const url = new URL(origin);
+
+      if (url.hostname === 'internal' || url.hostname === 'localhost' || url.port === '0') {
+        cleanOrigin = 'https://checkmatex-worker-production.rohitvinod-dev.workers.dev';
+      }
+
+      if (url.port === '0' || url.port === '443' || url.port === '80') {
+        cleanOrigin = `${url.protocol}//${url.hostname}`;
+      }
+    } catch (e) {
+      console.error('Invalid origin provided:', origin, e);
+      cleanOrigin = 'https://checkmatex-worker-production.rohitvinod-dev.workers.dev';
+    }
+
+    const wsBaseUrl = cleanOrigin
+      .replace(/^https:/, 'wss:')
+      .replace(/^http:/, 'ws:');
+
+    const wsUrl = `${wsBaseUrl}/parties/game-room/${roomId}?` +
+      `playerId=${encodeURIComponent(playerInfo.playerId)}` +
+      `&displayName=${encodeURIComponent(playerInfo.displayName)}` +
+      `&rating=${playerInfo.rating}` +
+      `&isProvisional=${playerInfo.isProvisional}` +
+      `&color=${playerInfo.color}`;
+
+    if (wsUrl.includes(':0/') || wsUrl.includes(':0?')) {
+      throw new Error(`Invalid WebSocket URL generated: ${wsUrl}`);
+    }
+
+    console.log(`Generated WebSocket URL: ${wsUrl}`);
+    return wsUrl;
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+
+    if (url.pathname === "/queue/join" && request.method === "POST") {
+      return this.handleJoinQueue(request);
+    }
+
+    if (url.pathname === "/queue/status" && request.method === "GET") {
+      return this.handleStatusCheck(request);
+    }
+
+    if (url.pathname === "/queue/leave" && request.method === "POST") {
+      return this.handleLeaveQueue(request);
+    }
+
+    if (url.pathname === "/queue/info" && request.method === "GET") {
+      return this.handleQueueInfo();
+    }
+
+    return new Response("Not found", { status: 404 });
+  }
+
+  private async handleJoinQueue(request: Request): Promise<Response> {
+    await this.loadQueue();
+    await this.loadPendingMatches();
+    await this.cleanupExpiredEntries();
+    await this.cleanupExpiredPendingMatches();
+
+    const body = await request.json() as {
+      playerId: string;
+      displayName: string;
+      rating: number;
+      isProvisional: boolean;
+      gameMode: GameMode;
+      joinedAt: number;
+      origin?: string;
+    };
+
+    const pendingMatch = this.pendingMatches.get(body.playerId);
+    if (pendingMatch) {
+      console.log(`MatchmakingQueue: Player ${body.playerId} has pending match, returning it`);
+      this.pendingMatches.delete(body.playerId);
+      await this.savePendingMatches();
+
+      return new Response(
+        JSON.stringify({
+          matched: true,
+          roomId: pendingMatch.roomId,
+          color: pendingMatch.color,
+          opponentId: pendingMatch.opponentId,
+          opponentDisplayName: pendingMatch.opponentDisplayName,
+          opponentRating: pendingMatch.opponentRating,
+          accessToken: pendingMatch.accessToken,
+          webSocketUrl: pendingMatch.webSocketUrl,
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      );
+    }
+
+    const existingIndex = this.queue.findIndex(e => e.playerId === body.playerId);
+    if (existingIndex !== -1) {
+      this.queue.splice(existingIndex, 1);
+      console.log(`MatchmakingQueue: Removed duplicate entry for player ${body.playerId}`);
+    }
+
+    const now = Date.now();
+    const entry: QueueEntry = {
+      playerId: body.playerId,
+      displayName: body.displayName,
+      rating: body.rating,
+      isProvisional: body.isProvisional,
+      gameMode: body.gameMode,
+      joinedAt: body.joinedAt || now,
+      minRating: 0,
+      maxRating: 0,
+      expiresAt: now + (MATCHMAKING_TIMEOUT_SECONDS * 1000),
+      origin: body.origin,
+    };
+
+    const range = this.calculateRatingRange(entry);
+    entry.minRating = range.min;
+    entry.maxRating = range.max;
+
+    const match = this.findMatch(entry);
+
+    if (match) {
+      this.queue = this.queue.filter(e => e.playerId !== match.playerId);
+      await this.saveQueue();
+
+      const roomId = this.generateGameRoomId(entry.playerId, match.playerId);
+
+      try {
+        const statsNamespace = this.env.STATS_TRACKER;
+        const statsId = statsNamespace.idFromName("global-stats");
+        const statsStub = statsNamespace.get(statsId);
+        await statsStub.fetch(
+          new Request("https://internal/stats/game-created", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ gameId: roomId }),
+          })
+        );
+      } catch (error) {
+        console.error("Failed to track game creation:", error);
+      }
+
+      const playerColor = Math.random() > 0.5 ? "white" : "black";
+      const opponentColor = playerColor === "white" ? "black" : "white";
+
+      const playerAccessToken = this.generateAccessToken(entry.playerId);
+      const opponentAccessToken = this.generateAccessToken(match.playerId);
+
+      const playerWsUrl = this.buildWebSocketUrl(
+        body.origin || "https://checkmatex-worker-production.rohitvinod-dev.workers.dev",
+        roomId,
+        {
+          playerId: entry.playerId,
+          displayName: entry.displayName,
+          rating: entry.rating,
+          isProvisional: entry.isProvisional,
+          color: playerColor,
+        }
+      );
+
+      const opponentWsUrl = this.buildWebSocketUrl(
+        body.origin || "https://checkmatex-worker-production.rohitvinod-dev.workers.dev",
+        roomId,
+        {
+          playerId: match.playerId,
+          displayName: match.displayName,
+          rating: match.rating,
+          isProvisional: match.isProvisional,
+          color: opponentColor,
+        }
+      );
+
+      const matchExpiresAt = now + (60 * 1000);
+
+      const opponentPendingMatch: PendingMatch = {
+        roomId,
+        color: opponentColor,
+        opponentId: entry.playerId,
+        opponentDisplayName: entry.displayName,
+        opponentRating: entry.rating,
+        accessToken: opponentAccessToken,
+        webSocketUrl: opponentWsUrl,
+        createdAt: now,
+        expiresAt: matchExpiresAt,
+      };
+
+      this.pendingMatches.set(match.playerId, opponentPendingMatch);
+      await this.savePendingMatches();
+
+      console.log(`MatchmakingQueue: Created match ${roomId}`);
+
+      return new Response(
+        JSON.stringify({
+          matched: true,
+          roomId,
+          color: playerColor,
+          opponentId: match.playerId,
+          opponentDisplayName: match.displayName,
+          opponentRating: match.rating,
+          accessToken: playerAccessToken,
+          webSocketUrl: playerWsUrl,
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      );
+    }
+
+    this.queue.push(entry);
+    await this.saveQueue();
+
+    return new Response(
+      JSON.stringify({
+        matched: false,
+        queuePosition: this.queue.length,
+        estimatedWait: MATCHMAKING_TIMEOUT_SECONDS,
+      }),
+      { status: 200, headers: { "Content-Type": "application/json" } }
+    );
+  }
+
+  private async handleStatusCheck(request: Request): Promise<Response> {
+    // Implementation similar to handleJoinQueue but for status checking
+    const url = new URL(request.url);
+    const playerId = url.searchParams.get('playerId');
+
+    if (!playerId) {
+      return new Response(JSON.stringify({ error: 'Missing playerId' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
+    await this.loadQueue();
+    await this.loadPendingMatches();
+    await this.cleanupExpiredEntries();
+    await this.cleanupExpiredPendingMatches();
+
+    const entry = this.queue.find(e => e.playerId === playerId);
+
+    if (!entry) {
+      return new Response(JSON.stringify({
+        inQueue: false,
+        message: 'Player not in queue',
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
+    const waitTime = (Date.now() - entry.joinedAt) / 1000;
+    const range = this.calculateRatingRange(entry);
+
+    return new Response(JSON.stringify({
+      inQueue: true,
+      matched: false,
+      queuePosition: this.queue.indexOf(entry) + 1,
+      totalInQueue: this.queue.length,
+      waitTimeSeconds: Math.floor(waitTime),
+      currentRatingRange: range,
+      expiresIn: Math.floor((entry.expiresAt - Date.now()) / 1000),
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+
+  private async handleLeaveQueue(request: Request): Promise<Response> {
+    const body = await request.json() as { playerId: string };
+
+    await this.loadQueue();
+
+    const initialLength = this.queue.length;
+    this.queue = this.queue.filter(e => e.playerId !== body.playerId);
+
+    if (this.queue.length < initialLength) {
+      await this.saveQueue();
+      console.log(`MatchmakingQueue: Player ${body.playerId} left queue`);
+    }
+
+    return new Response(JSON.stringify({ success: true }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+
+  private async handleQueueInfo(): Promise<Response> {
+    await this.loadQueue();
+    await this.cleanupExpiredEntries();
+
+    return new Response(
+      JSON.stringify({
+        queueSize: this.queue.length,
+        players: this.queue.map((entry) => ({
+          gameMode: entry.gameMode,
+          rating: entry.rating,
+          waitTime: Date.now() - entry.joinedAt,
+          expiresIn: Math.floor((entry.expiresAt - Date.now()) / 1000),
+        })),
+      }),
+      { status: 200, headers: { "Content-Type": "application/json" } }
+    );
+  }
+
+  private generateAccessToken(playerId: string): string {
+    const payload = {
+      playerId,
+      iat: Date.now(),
+      exp: Date.now() + 3600000,
+    };
+    const jsonStr = JSON.stringify(payload);
+    return btoa(jsonStr);
+  }
+}
+
+// ============ STATS TRACKER (from old index.ts) ============
+export class StatsTracker {
+  private state: DurableObjectState;
+  private env: Env;
+  private sql: SqlStorage;
+
+  constructor(state: DurableObjectState, env: Env) {
+    this.state = state;
+    this.env = env;
+    this.sql = this.state.storage.sql;
+    this.initializeDatabase();
+  }
+
+  private initializeDatabase() {
+    this.sql.exec(
+      `CREATE TABLE IF NOT EXISTS active_connections (
+        connection_id TEXT PRIMARY KEY,
+        player_id TEXT NOT NULL,
+        connected_at INTEGER NOT NULL
+      )`
+    );
+
+    this.sql.exec(
+      `CREATE TABLE IF NOT EXISTS game_history (
+        game_id TEXT PRIMARY KEY,
+        created_at INTEGER NOT NULL
+      )`
+    );
+
+    this.sql.exec(
+      `CREATE INDEX IF NOT EXISTS idx_game_created_at ON game_history(created_at)`
+    );
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const corsHeaders = {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type",
+    };
+
+    if (request.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: corsHeaders });
+    }
+
+    if (url.pathname === "/stats/online-players" && request.method === "GET") {
+      try {
+        const result = this.sql.exec(
+          `SELECT COUNT(DISTINCT player_id) as count FROM active_connections`
+        );
+        const count = result.toArray()[0]?.count || 0;
+
+        return new Response(
+          JSON.stringify({ count }),
+          { status: 200, headers: corsHeaders }
+        );
+      } catch (error) {
+        console.error("Error getting online players:", error);
+        return new Response(
+          JSON.stringify({ count: 0, error: String(error) }),
+          { status: 200, headers: corsHeaders }
+        );
+      }
+    }
+
+    if (url.pathname === "/stats/games-24h" && request.method === "GET") {
+      try {
+        const oneDayAgo = Date.now() - (24 * 60 * 60 * 1000);
+        const twoDaysAgo = Date.now() - (48 * 60 * 60 * 1000);
+
+        this.sql.exec(
+          `DELETE FROM game_history WHERE created_at < ${twoDaysAgo}`
+        );
+
+        const result = this.sql.exec(
+          `SELECT COUNT(*) as count FROM game_history WHERE created_at >= ${oneDayAgo}`
+        );
+        const count = result.toArray()[0]?.count || 0;
+
+        return new Response(
+          JSON.stringify({ count }),
+          { status: 200, headers: corsHeaders }
+        );
+      } catch (error) {
+        console.error("Error getting games-24h:", error);
+        return new Response(
+          JSON.stringify({ count: 0, error: String(error) }),
+          { status: 200, headers: corsHeaders }
+        );
+      }
+    }
+
+    if (url.pathname === "/stats/player-connected" && request.method === "POST") {
+      try {
+        const body = await request.json() as { playerId: string; connectionId: string };
+
+        const fiveMinutesAgo = Date.now() - (5 * 60 * 1000);
+        this.sql.exec(
+          `DELETE FROM active_connections WHERE connected_at < ${fiveMinutesAgo}`
+        );
+
+        this.sql.exec(
+          `INSERT OR REPLACE INTO active_connections (connection_id, player_id, connected_at)
+           VALUES ('${body.connectionId}', '${body.playerId}', ${Date.now()})`
+        );
+
+        return new Response(
+          JSON.stringify({ success: true }),
+          { status: 200, headers: corsHeaders }
+        );
+      } catch (error) {
+        console.error("Error tracking player connection:", error);
+        return new Response(
+          JSON.stringify({ success: false, error: String(error) }),
+          { status: 500, headers: corsHeaders }
+        );
+      }
+    }
+
+    if (url.pathname === "/stats/player-disconnected" && request.method === "POST") {
+      try {
+        const body = await request.json() as { connectionId: string };
+
+        this.sql.exec(
+          `DELETE FROM active_connections WHERE connection_id = '${body.connectionId}'`
+        );
+
+        return new Response(
+          JSON.stringify({ success: true }),
+          { status: 200, headers: corsHeaders }
+        );
+      } catch (error) {
+        console.error("Error tracking player disconnection:", error);
+        return new Response(
+          JSON.stringify({ success: false, error: String(error) }),
+          { status: 500, headers: corsHeaders }
+        );
+      }
+    }
+
+    if (url.pathname === "/stats/game-created" && request.method === "POST") {
+      try {
+        const body = await request.json() as { gameId: string };
+
+        this.sql.exec(
+          `INSERT OR IGNORE INTO game_history (game_id, created_at)
+           VALUES ('${body.gameId}', ${Date.now()})`
+        );
+
+        return new Response(
+          JSON.stringify({ success: true }),
+          { status: 200, headers: corsHeaders }
+        );
+      } catch (error) {
+        console.error("Error tracking game creation:", error);
+        return new Response(
+          JSON.stringify({ success: false, error: String(error) }),
+          { status: 500, headers: corsHeaders }
+        );
+      }
+    }
+
+    return new Response("Not found", { status: 404, headers: corsHeaders });
+  }
+}
+
+// ============ MAIN WORKER ============
+function getCanonicalOrigin(requestUrl: string): string {
+  try {
+    const url = new URL(requestUrl);
+
+    if (url.hostname === 'internal' || url.hostname === 'localhost' || url.port === '0') {
+      return 'https://checkmatex-worker-production.rohitvinod-dev.workers.dev';
+    }
+
+    const protocol = url.protocol;
+    const hostname = url.hostname;
+    const port = url.port;
+
+    if (port === '' || port === '0' ||
+        (protocol === 'https:' && port === '443') ||
+        (protocol === 'http:' && port === '80')) {
+      return `${protocol}//${hostname}`;
+    }
+
+    return `${protocol}//${hostname}:${port}`;
+  } catch (e) {
+    console.error('Failed to parse request URL:', e);
+    return 'https://checkmatex-worker-production.rohitvinod-dev.workers.dev';
+  }
+}
+
+async function handleMatchmake(
+  request: Request,
+  env: Env
+): Promise<Response> {
+  try {
+    const body = await request.json() as {
+      playerId: string;
+      displayName: string;
+      rating: number;
+      isProvisional: boolean;
+      gameMode: GameMode;
+      authToken: string;
+    };
+
+    const {
+      playerId,
+      displayName,
+      rating,
+      isProvisional,
+      gameMode,
+      authToken,
+    } = body;
+
+    if (!playerId || !gameMode || !authToken) {
+      return new Response(
+        JSON.stringify({
+          error: "Missing required fields",
+        }),
+        { status: 400, headers: { "Content-Type": "application/json" } }
+      );
+    }
+
+    const queueNamespace = env.MATCHMAKING_QUEUE;
+    const queueId = queueNamespace.idFromName("global-queue");
+    const queueStub = queueNamespace.get(queueId);
+
+    const realOrigin = getCanonicalOrigin(request.url);
+    console.log('Extracted origin:', realOrigin, 'from request URL:', request.url);
+    const response = await queueStub.fetch(
+      new Request("https://internal/queue/join", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          playerId,
+          displayName,
+          rating,
+          isProvisional,
+          gameMode,
+          joinedAt: Date.now(),
+          origin: realOrigin,
+        }),
+      })
+    );
+
+    if (!response.ok) {
+      return response;
+    }
+
+    const matchInfo = await response.json() as {
+      matched: boolean;
+      roomId?: string;
+      color?: string;
+      accessToken?: string;
+      webSocketUrl?: string;
+      queuePosition?: number;
+      estimatedWait?: number;
+    };
+
+    return new Response(JSON.stringify(matchInfo), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  } catch (error) {
+    console.error("Error in matchmake:", error);
+    return new Response(
+      JSON.stringify({
+        error: "Internal server error",
+        message: String(error),
+      }),
+      { status: 500, headers: { "Content-Type": "application/json" } }
+    );
+  }
+}
+
+async function handleOnlinePlayersStats(env: Env): Promise<Response> {
+  try {
+    const statsNamespace = env.STATS_TRACKER;
+    const statsId = statsNamespace.idFromName("global-stats");
+    const statsStub = statsNamespace.get(statsId);
+
+    const response = await statsStub.fetch(
+      new Request("https://internal/stats/online-players", {
+        method: "GET",
+      })
+    );
+
+    return response;
+  } catch (error) {
+    console.error("Error fetching online players stats:", error);
+    return new Response(
+      JSON.stringify({ count: 0, error: String(error) }),
+      {
+        status: 200,
+        headers: {
+          "Content-Type": "application/json",
+          "Access-Control-Allow-Origin": "*"
+        }
+      }
+    );
+  }
+}
+
+async function handleGames24hStats(env: Env): Promise<Response> {
+  try {
+    const statsNamespace = env.STATS_TRACKER;
+    const statsId = statsNamespace.idFromName("global-stats");
+    const statsStub = statsNamespace.get(statsId);
+
+    const response = await statsStub.fetch(
+      new Request("https://internal/stats/games-24h", {
+        method: "GET",
+      })
+    );
+
+    return response;
+  } catch (error) {
+    console.error("Error fetching games-24h stats:", error);
+    return new Response(
+      JSON.stringify({ count: 0, error: String(error) }),
+      {
+        status: 200,
+        headers: {
+          "Content-Type": "application/json",
+          "Access-Control-Allow-Origin": "*"
+        }
+      }
+    );
+  }
+}
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
+
+    // CORS headers
+    const corsHeaders = {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    };
+
+    // Handle CORS preflight
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { status: 204, headers: corsHeaders });
+    }
+
+    // Route PartyKit requests (chat and games)
+    const partykitResponse = await routePartykitRequest(request, {
+      ...env,
+    });
+    if (partykitResponse) {
+      return partykitResponse;
+    }
+
+    // Initialize Firestore client
+    const firestore = new FirestoreClient({
+      projectId: env.FIREBASE_PROJECT_ID,
+      serviceAccount: env.FIREBASE_SERVICE_ACCOUNT,
+    });
+
+    try {
+      // ========== MULTIPLAYER ENDPOINTS ==========
+
+      // Matchmaking
+      if (url.pathname === "/matchmake" && request.method === "POST") {
+        return handleMatchmake(request, env);
+      }
+
+      // Match result processing
+      if (url.pathname === '/api/multiplayer/match-result' && request.method === 'POST') {
+        const response = await handleMatchResult(request, firestore);
+        return addCorsHeaders(response, corsHeaders);
+      }
+
+      // Player ratings
+      if (url.pathname === '/api/multiplayer/ratings' && request.method === 'GET') {
+        const playerId = url.searchParams.get('playerId');
+        if (!playerId) {
+          return new Response(
+            JSON.stringify({ error: 'Missing playerId parameter' }),
+            { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          );
+        }
+
+        const ratings = await firestore.getDocument(`users/${playerId}/profile/ratings`);
+        return new Response(
+          JSON.stringify(ratings || { elo: 1200, eloGamesPlayed: 0 }),
+          { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+
+      // ========== USER ENDPOINTS ==========
+
+      // Username uniqueness check
+      if (url.pathname === '/api/users/username/check' && request.method === 'GET') {
+        const user = await authenticateRequest(request, env.FIREBASE_PROJECT_ID);
+        const username = url.searchParams.get('username');
+        if (!username) {
+          return new Response(
+            JSON.stringify({ error: 'Missing username parameter' }),
+            { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+          );
+        }
+
+        const results = await firestore.queryDocuments('users', [
+          { field: 'username', op: 'EQUAL', value: username },
+        ]);
+
+        // Username is unique if:
+        // 1. No results found, OR
+        // 2. Only result is the current user's own username
+        const isUnique = results.length === 0 ||
+          (results.length === 1 && results[0]._id === user.uid);
+
+        return new Response(
+          JSON.stringify({ isUnique }),
+          { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+
+      // Ensure user profile (Phase 2)
+      if (url.pathname === '/api/users/profile' && request.method === 'POST') {
+        const user = await authenticateRequest(request, env.FIREBASE_PROJECT_ID);
+        const response = await handleEnsureUserProfile(request, firestore, user);
+        return addCorsHeaders(response, corsHeaders);
+      }
+
+      // Register device token (Phase 2)
+      if (url.pathname === '/api/users/device' && request.method === 'POST') {
+        const user = await authenticateRequest(request, env.FIREBASE_PROJECT_ID);
+        const response = await handleRegisterDevice(request, firestore, user);
+        return addCorsHeaders(response, corsHeaders);
+      }
+
+      // ========== PROGRESS TRACKING ENDPOINTS (Phase 2) ==========
+
+      // Record progress event
+      if (url.pathname === '/api/progress/record' && request.method === 'POST') {
+        const user = await authenticateRequest(request, env.FIREBASE_PROJECT_ID);
+        const response = await handleRecordProgress(request, firestore, user, env);
+        return addCorsHeaders(response, corsHeaders);
+      }
+
+      // Claim energy reward
+      if (url.pathname === '/api/progress/energy/claim' && request.method === 'POST') {
+        const user = await authenticateRequest(request, env.FIREBASE_PROJECT_ID);
+        const response = await handleClaimEnergyReward(request, firestore, user, env);
+        return addCorsHeaders(response, corsHeaders);
+      }
+
+      // ========== NOTIFICATION ENDPOINTS (Phase 3) ==========
+
+      // Enqueue notification
+      if (url.pathname === '/api/notifications/enqueue' && request.method === 'POST') {
+        const user = await authenticateRequest(request, env.FIREBASE_PROJECT_ID);
+        const response = await handleEnqueueNotification(request, firestore, user, env);
+        return addCorsHeaders(response, corsHeaders);
+      }
+
+      // Update notification preferences
+      if (url.pathname === '/api/notifications/preferences' && request.method === 'POST') {
+        const user = await authenticateRequest(request, env.FIREBASE_PROJECT_ID);
+        const response = await handleUpdateNotificationPreferences(request, firestore, user);
+        return addCorsHeaders(response, corsHeaders);
+      }
+
+      // Track notification opened
+      if (url.pathname === '/api/notifications/track' && request.method === 'POST') {
+        const user = await authenticateRequest(request, env.FIREBASE_PROJECT_ID);
+        const response = await handleTrackNotificationOpened(request, firestore, user);
+        return addCorsHeaders(response, corsHeaders);
+      }
+
+      // ========== CUSTOM OPENINGS & ACHIEVEMENTS ENDPOINTS (Phase 4) ==========
+
+      // Manage custom openings (CRUD)
+      if (url.pathname === '/api/openings/manage' && request.method === 'POST') {
+        const user = await authenticateRequest(request, env.FIREBASE_PROJECT_ID);
+        const response = await handleManageOpenings(request, firestore, user);
+        return addCorsHeaders(response, corsHeaders);
+      }
+
+      // Sync achievements
+      if (url.pathname === '/api/achievements/sync' && request.method === 'POST') {
+        const user = await authenticateRequest(request, env.FIREBASE_PROJECT_ID);
+        const response = await handleSyncAchievements(request, firestore, user);
+        return addCorsHeaders(response, corsHeaders);
+      }
+
+      // ========== LOBBY ENDPOINTS ==========
+
+      // Create lobby
+      if (url.pathname === '/api/lobby/create' && request.method === 'POST') {
+        const user = await authenticateRequest(request, env.FIREBASE_PROJECT_ID);
+        const response = await createLobbyHandler(request, env, user);
+        return addCorsHeaders(response, corsHeaders);
+      }
+
+      // List lobbies
+      if (url.pathname === '/api/lobby/list' && request.method === 'GET') {
+        const response = await listLobbiesHandler(request, env);
+        return addCorsHeaders(response, corsHeaders);
+      }
+
+      // Join lobby
+      if (url.pathname === '/api/lobby/join' && request.method === 'POST') {
+        const user = await authenticateRequest(request, env.FIREBASE_PROJECT_ID);
+        const response = await joinLobbyHandler(request, env, user);
+        return addCorsHeaders(response, corsHeaders);
+      }
+
+      // Spectate lobby
+      if (url.pathname === '/api/lobby/spectate' && request.method === 'POST') {
+        const user = await authenticateRequest(request, env.FIREBASE_PROJECT_ID);
+        const response = await spectateLobbyHandler(request, env, user);
+        return addCorsHeaders(response, corsHeaders);
+      }
+
+      // Delete lobby
+      if (url.pathname.startsWith('/api/lobby/') && request.method === 'DELETE') {
+        const user = await authenticateRequest(request, env.FIREBASE_PROJECT_ID);
+        const lobbyId = url.pathname.split('/')[3];
+        const response = await deleteLobbyHandler(request, env, user, lobbyId);
+        return addCorsHeaders(response, corsHeaders);
+      }
+
+      // ========== STATS ENDPOINTS ==========
+
+      if (url.pathname === "/stats/online-players" && request.method === "GET") {
+        return handleOnlinePlayersStats(env);
+      }
+
+      if (url.pathname === "/stats/games-24h" && request.method === "GET") {
+        return handleGames24hStats(env);
+      }
+
+      // ========== HEALTH CHECK ==========
+
+      if (url.pathname === '/health' && request.method === 'GET') {
+        return new Response(
+          JSON.stringify({
+            status: 'ok',
+            timestamp: Date.now(),
+            environment: env.ENVIRONMENT,
+          }),
+          { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
+      }
+
+      // Fall back to static assets or 404
+      if (env.ASSETS) {
+        return env.ASSETS.fetch(request);
+      }
+
+      return new Response('Not Found', { status: 404 });
+    } catch (error) {
+      console.error('Worker error:', error);
+      return new Response(
+        JSON.stringify({ error: 'Internal server error', message: String(error) }),
+        { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+  },
+
+  // ========== SCHEDULED CRON JOBS (Phase 5 - Queue-Based, Scalable to Millions!) ==========
+  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    console.log(`[Cron] Triggered at ${new Date(event.scheduledTime).toISOString()}`);
+    console.log(`[Cron] Cron expression: ${event.cron}`);
+
+    // Initialize Firestore client
+    const firestore = new FirestoreClient(env.FIREBASE_SERVICE_ACCOUNT, env.FIREBASE_PROJECT_ID);
+
+    try {
+      // LIGHTWEIGHT cron jobs that only enqueue messages
+      // Actual processing happens in queue consumers (parallel batches)
+      switch (event.cron) {
+        case '0 2 * * *': {
+          // 2 AM UTC - Daily leaderboard cleanup (enqueue entries)
+          console.log('[Cron] Enqueuing leaderboard entries for cleanup...');
+          const result = await enqueueLeaderboardCleanup(firestore, env.CLEANUP_QUEUE);
+          console.log(`[Cron] Cleanup enqueue result:`, result);
+          break;
+        }
+
+        case '0 9 * * *': {
+          // 9 AM UTC - Daily streak reminders (enqueue users)
+          console.log('[Cron] Enqueuing users for streak reminders...');
+          const result = await enqueueStreakReminders(firestore, env.REMINDERS_QUEUE);
+          console.log(`[Cron] Reminders enqueue result:`, result);
+          break;
+        }
+
+        case '0 21 * * *': {
+          // 9 PM UTC - Last-chance streak savers (enqueue users)
+          console.log('[Cron] Enqueuing users for last-chance reminders...');
+          const result = await enqueueLastChanceReminders(firestore, env.LAST_CHANCE_QUEUE);
+          console.log(`[Cron] Last-chance enqueue result:`, result);
+          break;
+        }
+
+        default:
+          console.warn(`[Cron] Unknown cron expression: ${event.cron}`);
+      }
+    } catch (error) {
+      console.error('[Cron] Scheduled job failed:', error);
+      // Don't throw - let the cron continue on next schedule
+    }
+  },
+
+  // ========== QUEUE CONSUMERS (Phase 5 - Process Messages in Parallel) ==========
+  async queue(batch: MessageBatch, env: Env, ctx: ExecutionContext): Promise<void> {
+    console.log(`[Queue] Processing batch from queue: ${batch.queue}`);
+    console.log(`[Queue] Batch size: ${batch.messages.length} messages`);
+
+    // Initialize Firestore client
+    const firestore = new FirestoreClient(env.FIREBASE_SERVICE_ACCOUNT, env.FIREBASE_PROJECT_ID);
+
+    try {
+      // Route to appropriate queue consumer based on queue name
+      switch (batch.queue) {
+        case 'leaderboard-cleanup-queue': {
+          const result = await processCleanupBatch(batch as any, firestore);
+          console.log(`[Queue] Cleanup batch result:`, result);
+          break;
+        }
+
+        case 'streak-reminders-queue': {
+          const result = await processRemindersBatch(batch as any, firestore, env);
+          console.log(`[Queue] Reminders batch result:`, result);
+          break;
+        }
+
+        case 'last-chance-queue': {
+          const result = await processLastChanceBatch(batch as any, firestore, env);
+          console.log(`[Queue] Last-chance batch result:`, result);
+          break;
+        }
+
+        default:
+          console.warn(`[Queue] Unknown queue: ${batch.queue}`);
+          // Ack all messages to prevent redelivery
+          batch.messages.forEach(msg => msg.ack());
+      }
+    } catch (error) {
+      console.error('[Queue] Queue processing failed:', error);
+      // Messages will be retried automatically (up to max_retries)
+    }
+  },
+} satisfies ExportedHandler<Env>;
+
+// Helper to add CORS headers to response
+function addCorsHeaders(response: Response, corsHeaders: Record<string, string>): Response {
+  const newHeaders = new Headers(response.headers);
+  Object.entries(corsHeaders).forEach(([key, value]) => {
+    newHeaders.set(key, value);
+  });
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: newHeaders,
+  });
+}
