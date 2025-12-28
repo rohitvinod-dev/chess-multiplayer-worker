@@ -10,6 +10,7 @@
 import type { FirestoreClient } from '../../firestore';
 import type { AuthenticatedUser, RegisterDeviceRequest } from '../../types';
 import { ApiError, ErrorCodes } from '../../types';
+import { formatTimestamp } from '../../utils/mastery';
 import * as crypto from 'crypto';
 
 /**
@@ -58,10 +59,10 @@ export async function handleRegisterDevice(
       installationId: installationId || null,
       platform,
       appVersion,
-      lastSeenAt: { _seconds: Math.floor(now.getTime() / 1000), _nanoseconds: 0 },
-      registeredAt: existingDevice?.registeredAt || { _seconds: Math.floor(now.getTime() / 1000), _nanoseconds: 0 }, // ADD
-      updatedAt: { _seconds: Math.floor(now.getTime() / 1000), _nanoseconds: 0 }, // ADD
-      isActive: true, // ADD
+      lastSeenAt: formatTimestamp(now),
+      registeredAt: existingDevice?.registeredAt || formatTimestamp(now),
+      updatedAt: formatTimestamp(now),
+      isActive: true,
     };
 
     await firestore.setDocument(
@@ -72,7 +73,7 @@ export async function handleRegisterDevice(
 
     // Update user's latest FCM token
     const userUpdates: any = {
-      updatedAt: { _seconds: Math.floor(now.getTime() / 1000), _nanoseconds: 0 },
+      updatedAt: formatTimestamp(now),
     };
     if (token) {
       userUpdates.latestFcmToken = token;

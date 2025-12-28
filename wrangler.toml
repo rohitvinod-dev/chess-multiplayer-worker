@@ -89,15 +89,26 @@ bindings = [
 name = "checkmatex-worker-staging"
 vars = { FIREBASE_PROJECT_ID = "openings-trainer", ENVIRONMENT = "staging" }
 
+[env.staging.durable_objects]
+bindings = [
+  { name = "GAME_ROOM", class_name = "GameRoom" },
+  { name = "CHAT", class_name = "Chat" },
+  { name = "MATCHMAKING_QUEUE", class_name = "MatchmakingQueue" },
+  { name = "STATS_TRACKER", class_name = "StatsTracker" },
+  { name = "USER_PROFILE", class_name = "UserProfile" },
+  { name = "LOBBY_LIST", class_name = "LobbyList" },
+  { name = "LOBBY_ROOM", class_name = "LobbyRoom" }
+]
+
 # Cron Triggers (Phase 5)
 # NOTE: Free plan has limit of 5 cron triggers total across all workers
-# Temporarily disabled - can be enabled with paid plan or manually triggered
-# [triggers]
-# crons = [
-#   "0 2 * * *",   # Daily cleanup at 2 AM UTC - Remove deleted users from leaderboards
-#   "0 9 * * *",   # Daily streak reminders at 9 AM UTC - Send training reminders
-#   "0 21 * * *"   # Last chance reminders at 9 PM UTC - Save streaks before midnight
-# ]
+# Using direct processing instead of queues (works on free plan!)
+[triggers]
+crons = [
+  "0 2 * * *",   # Daily cleanup at 2 AM UTC - Remove deleted users from leaderboards
+  "0 9 * * *",   # Daily streak reminders at 9 AM UTC - Send training reminders
+  "0 21 * * *"   # Last chance reminders at 9 PM UTC - Save streaks before midnight
+]
 
 # Queues Configuration (Phase 5 - Scalable Cron Jobs)
 # NOTE: Queues require Cloudflare Workers Paid plan - disabled for now

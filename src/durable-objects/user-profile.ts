@@ -24,16 +24,20 @@ import { POINTS_CONFIG, ENERGY_CONFIG, ApiError, ErrorCodes } from '../types';
 import {
   analyzeProgressMap,
   computeProgressStats,
+  computeCombinedProgressStats,
   variationIdFromKey,
   openingIdFromKey,
   clamp,
   toDateTime,
   startOfLocalDay,
+  formatTimestamp,
+  formatDateKey,
   getEnergyState,
   applyEnergyReward,
   serializeEnergyState,
   calculateStreak,
 } from '../utils/mastery';
+import type { ModeProgress } from '../utils/mastery';
 import { FirestoreClient } from '../firestore';
 
 interface Env {
@@ -189,13 +193,26 @@ export class UserProfile {
    * NOW SUPPORTS MODE-SPECIFIC TRACKING (focused vs explore)
    */
   private async recordProgress(data: RecordProgressEventRequest): Promise<any> {
-    const { variationKey, progressType, newLevel, delta, eventId, mode } = data;
+    const { variationKey, progressType, newLevel, delta, eventId, mode, totalSystemLines } = data;
     const firestore = this.firestore;
     const userId = this.userId!; // Non-null assertion - we set this in fetch()
+
+    // Log key request details for monitoring
+    console.log(`[UserProfile] Recording ${progressType} progress for ${mode} mode: ${variationKey}`);
 
     // Validate inputs
     if (!variationKey || !variationKey.trim()) {
       throw new ApiError(ErrorCodes.INVALID_ARGUMENT, 'A variationKey is required.');
+    }
+
+    // Reject legacy hash-based keys (format: "var_xxxxxxxxxxxx") from old implementation
+    // These should not be written to Firestore as they break opening name extraction
+    if (variationKey.startsWith('var_')) {
+      console.warn(`[UserProfile] Rejecting legacy hash-based variationKey: ${variationKey}`);
+      throw new ApiError(
+        ErrorCodes.INVALID_ARGUMENT,
+        'Legacy hash-based variation keys are not supported. Please update your app.'
+      );
     }
 
     if (!progressType || !['learn', 'mastery'].includes(progressType)) {
@@ -207,7 +224,6 @@ export class UserProfile {
 
     // Default to focused mode for backward compatibility
     const trainingMode = mode || 'focused';
-    console.log(`[UserProfile] Recording progress for mode: ${trainingMode}`);
 
     // Check for duplicate event
     if (eventId) {
@@ -228,33 +244,47 @@ export class UserProfile {
     const now = new Date();
 
     // Load user profile from Firestore
-    console.log(`[UserProfile] Loading profile for userId: ${userId}, path: users/${userId}`);
     const userData = await firestore.getDocument(`users/${userId}`);
     if (!userData) {
-      console.error(`[UserProfile] User profile not found at path: users/${userId}`);
+      console.error(`[UserProfile] User profile not found: ${userId}`);
       throw new ApiError(
         ErrorCodes.FAILED_PRECONDITION,
         'User profile does not exist yet.'
       );
     }
-    console.log(`[UserProfile] Profile loaded, username field: ${userData.username}, displayName: ${userData.displayName}`);
 
     // Read mode-specific progress data (CLEAN SCHEMA - prefixed fields)
+    // Only 2 fields per mode: progressMap (mastery) and learnProgressMap (learn)
+    // firstAttemptMap and openingProgress are REMOVED as they are redundant
     const progressMapKey = `${trainingMode}_progressMap`;
     const learnProgressMapKey = `${trainingMode}_learnProgressMap`;
-    const firstAttemptMapKey = `${trainingMode}_firstAttemptMap`;
+
+    // DEBUG: Log what's coming from Firestore
+    console.log(`[UserProfile] Raw ${learnProgressMapKey} from Firestore:`, JSON.stringify(userData[learnProgressMapKey] || {}));
 
     let progressMap: ProgressMap = { ...(userData[progressMapKey] || {}) };
     let learnProgressMap: ProgressMap = { ...(userData[learnProgressMapKey] || {}) };
-    let firstAttemptMap: Record<string, boolean> = { ...(userData[firstAttemptMapKey] || {}) };
 
     // BACKWARD COMPATIBILITY: If prefixed fields don't exist, try legacy fields
     if (Object.keys(progressMap).length === 0 && trainingMode === 'focused') {
-      console.log('[UserProfile] Prefixed fields not found, using legacy fields');
       progressMap = { ...(userData.progressMap || {}) };
       learnProgressMap = { ...(userData.learnProgressMap || {}) };
-      firstAttemptMap = { ...(userData.firstAttemptMap || {}) };
+      if (Object.keys(learnProgressMap).length > 0) {
+        console.log(`[UserProfile] Using legacy fields, found ${Object.keys(learnProgressMap).length} entries`);
+      }
     }
+
+    // Filter out legacy hash-based keys (format: "var_xxxxxxxxxxxx") to prevent
+    // them from corrupting opening name extraction and stats calculation
+    progressMap = Object.fromEntries(
+      Object.entries(progressMap).filter(([key]) => !key.startsWith('var_'))
+    );
+    learnProgressMap = Object.fromEntries(
+      Object.entries(learnProgressMap).filter(([key]) => !key.startsWith('var_'))
+    );
+
+    console.log(`[UserProfile] After filtering: ${Object.keys(progressMap).length} mastery + ${Object.keys(learnProgressMap).length} learn entries`);
+    console.log(`[UserProfile] Current learn entries:`, Object.keys(learnProgressMap));
 
     // Determine target map
     const targetMap = progressType === 'mastery' ? progressMap : learnProgressMap;
@@ -356,36 +386,79 @@ export class UserProfile {
       }
     }
 
-    // Update first attempt map
-    if (progressType === 'mastery') {
-      if (firstAttemptMap[variationKey] === undefined) {
-        firstAttemptMap[variationKey] = true;
-      }
-      if (firstAttemptMap[variationKey] === true && finalNewLevel >= 3) {
-        firstAttemptMap[variationKey] = false;
-      }
-    }
+    // NOTE: firstAttemptMap removed - first attempt can be derived from progress level
+    // (previousLevel === 0 && finalNewLevel > 0 means first attempt)
 
-    // Calculate stats with 50-50 weighting
-    const stats = computeProgressStats(newMasteryAnalysis, newLearnAnalysis);
+    // Build mode progress data for combined calculation
+    // We need to read the OTHER mode's progress to compute combined stats
+    // Also filter out legacy hash keys from the other mode's data
+    const filterHashKeys = (map: ProgressMap): ProgressMap =>
+      Object.fromEntries(Object.entries(map).filter(([key]) => !key.startsWith('var_')));
 
-    // Prepare user updates (CLEAN SCHEMA - prefixed fields, no garbage)
+    const focusedMode: ModeProgress = trainingMode === 'focused'
+      ? { progressMap, learnProgressMap }
+      : {
+          progressMap: filterHashKeys({ ...(userData.focused_progressMap || userData.progressMap || {}) }),
+          learnProgressMap: filterHashKeys({ ...(userData.focused_learnProgressMap || userData.learnProgressMap || {}) }),
+        };
+
+    const exploreMode: ModeProgress = trainingMode === 'explore'
+      ? { progressMap, learnProgressMap }
+      : {
+          progressMap: filterHashKeys({ ...(userData.explore_progressMap || {}) }),
+          learnProgressMap: filterHashKeys({ ...(userData.explore_learnProgressMap || {}) }),
+        };
+
+    // Calculate COMBINED stats: 50% Focused + 50% Explore
+    // totalSystemLines is REQUIRED for accurate percentage calculation
+    // Use provided value, cached value, or fallback to 250 (total lines across 20 openings)
+    const DEFAULT_TOTAL_SYSTEM_LINES = 250;
+    const cachedValue = parseInt(String(userData.cachedTotalSystemLines), 10) || 0;
+    const effectiveTotalLines = totalSystemLines || cachedValue || DEFAULT_TOTAL_SYSTEM_LINES;
+
+    const stats = computeCombinedProgressStats(focusedMode, exploreMode, effectiveTotalLines);
+
+    // CRITICAL FIX: Use updateMapKey to update ONLY the specific variation key
+    // This prevents overwriting other openings' progress when updating one opening
+    const targetMapField = progressType === 'mastery'
+      ? `${trainingMode}_progressMap`
+      : `${trainingMode}_learnProgressMap`;
+
+    console.log(`[UserProfile] Updating ${targetMapField}["${variationKey}"] = ${finalNewLevel}`);
+
+    // Update the specific key in the map (atomic, doesn't affect other keys)
+    await firestore.updateMapKey(
+      `users/${userId}`,
+      targetMapField,
+      variationKey,
+      finalNewLevel
+    );
+
+    // Prepare other user updates (stats, points, etc.) - NOT the progress maps
     const userUpdates: any = {
-      // Mode-specific progress (PREFIXED FIELDS - flat, not nested)
-      [`${trainingMode}_progressMap`]: progressMap,
-      [`${trainingMode}_learnProgressMap`]: learnProgressMap,
-      [`${trainingMode}_firstAttemptMap`]: firstAttemptMap,
+      // COMPUTED stats - SINGLE SOURCE OF TRUTH (Flutter just reads these)
+      masteredVariations: stats.masteredVariations,
+      totalVariations: stats.totalVariations,
+      openingsMasteredCount: stats.openingsMasteredCount,
+      totalOpeningsCount: stats.totalOpeningsCount,
+      overallMasteryPercentage: stats.overallMasteryPercentage,
+      focusedMasteryPercentage: stats.focusedMasteryPercentage,
+      exploreMasteryPercentage: stats.exploreMasteryPercentage,
+      strongestOpening: stats.strongestOpening,
+      weakestOpening: stats.weakestOpening,
 
-      // Timestamp
-      updatedAt: { _seconds: Math.floor(now.getTime() / 1000), _nanoseconds: 0 },
+      // Timestamp - ISO format for analytics readability
+      updatedAt: formatTimestamp(now),
     };
 
-    // BACKWARD COMPATIBILITY: Keep legacy fields for old clients (30-day transition)
-    if (trainingMode === 'focused') {
-      userUpdates.progressMap = progressMap;
-      userUpdates.learnProgressMap = learnProgressMap;
-      userUpdates.firstAttemptMap = firstAttemptMap;
+    // Cache totalSystemLines for future calculations if provided
+    // This ensures consistent mastery % even when Flutter doesn't send it
+    if (totalSystemLines && totalSystemLines > 0) {
+      userUpdates.cachedTotalSystemLines = totalSystemLines;
     }
+
+    // NOTE: Backward compatibility writes REMOVED as of Dec 2025
+    // Old clients should have been updated by now
 
     // Increment points
     if (finalDelta > 0) {
@@ -412,10 +485,7 @@ export class UserProfile {
       streakInfo = calculateStreak(lastSessionTimestamp, currentStreak, now);
 
       userUpdates.currentStreak = streakInfo.currentStreak;
-      userUpdates.lastSessionDate = {
-        _seconds: Math.floor(startOfLocalDay(now).getTime() / 1000),
-        _nanoseconds: 0,
-      };
+      userUpdates.lastSessionDate = formatTimestamp(startOfLocalDay(now));
       userUpdates.totalSessions = (parseInt(String(userData.totalSessions), 10) || 0) + 1;
 
       // Grant energy for daily streak
@@ -438,14 +508,13 @@ export class UserProfile {
     // Update leaderboard
     // Try multiple username fields in order of preference
     const username = userData.username || userData.displayName || userData.email?.split('@')[0] || 'Anonymous';
-    console.log(`[UserProfile] Setting leaderboard username to: ${username}`);
 
     const leaderboardUpdates: any = {
       username: username,
       masteredVariations: stats.masteredVariations,
       openingsMasteredCount: stats.openingsMasteredCount,
       overallMasteryPercentage: stats.overallMasteryPercentage,
-      updatedAt: { _seconds: Math.floor(now.getTime() / 1000), _nanoseconds: 0 },
+      updatedAt: formatTimestamp(now),
     };
 
     if (streakInfo) {
@@ -462,12 +531,14 @@ export class UserProfile {
     // Update public/data with COMPUTED stats (not in main doc!)
     const publicDataUpdates: any = {
       username: username,
-      // COMPUTED stats (from progressMap analysis)
+      // COMPUTED stats (from progressMap analysis) - SINGLE SOURCE OF TRUTH
       masteredVariations: stats.masteredVariations,
       totalVariations: stats.totalVariations,
       openingsMasteredCount: stats.openingsMasteredCount,
       totalOpeningsCount: stats.totalOpeningsCount,
       overallMasteryPercentage: stats.overallMasteryPercentage,
+      focusedMasteryPercentage: stats.focusedMasteryPercentage,
+      exploreMasteryPercentage: stats.exploreMasteryPercentage,
       strongestOpening: stats.strongestOpening,
       weakestOpening: stats.weakestOpening,
       // Points (copied from main doc)
@@ -477,7 +548,7 @@ export class UserProfile {
       // Achievements (if available)
       unlockedAchievementIds: userData.unlocked_achievements || [],
       unlockedAchievementCount: (userData.unlocked_achievements || []).length,
-      updatedAt: { _seconds: Math.floor(now.getTime() / 1000), _nanoseconds: 0 },
+      updatedAt: formatTimestamp(now),
     };
 
     if (streakInfo) {
@@ -487,7 +558,45 @@ export class UserProfile {
     }
 
     await firestore.setDocument(`users/${userId}/public/data`, publicDataUpdates, { merge: true });
-    console.log('[UserProfile] Updated public/data with computed stats');
+
+    // Update activity logs (for Activity Graph and Streak Calendar)
+    // Only record activity when positive progress is made
+    if (finalDelta > 0) {
+      const dateKey = formatDateKey(startOfLocalDay(now));
+
+      // 1. Update activity_log map in public/data (for Streak Calendar widget)
+      // Uses updateMapKey to increment the count for today's date
+      try {
+        await firestore.updateMapKey(
+          `users/${userId}/public/data`,
+          'activity_log',
+          dateKey,
+          1 // Just set to 1; Flutter uses FieldValue.increment but REST API doesn't support it easily
+        );
+        console.log(`[UserProfile] Updated public/data.activity_log.${dateKey}`);
+      } catch (e) {
+        // Don't fail if activity_log update fails - it's not critical
+        console.warn(`[UserProfile] Failed to update public/data.activity_log: ${e}`);
+      }
+
+      // 2. Write to activity_log subcollection (for Profile Activity Graph)
+      // Each day gets a document with a count field
+      try {
+        // Use setDocument with merge to increment or create
+        await firestore.setDocument(
+          `users/${userId}/activity_log/${dateKey}`,
+          {
+            count: 1, // Simple count, will be merged/overwritten
+            updatedAt: formatTimestamp(now)
+          },
+          { merge: true }
+        );
+        console.log(`[UserProfile] Updated activity_log/${dateKey} document`);
+      } catch (e) {
+        // Don't fail if activity_log document update fails - it's not critical
+        console.warn(`[UserProfile] Failed to update activity_log document: ${e}`);
+      }
+    }
 
     // Record event for deduplication
     if (eventId) {
@@ -555,7 +664,7 @@ export class UserProfile {
     // Update Firestore
     await firestore.updateDocument(`users/${userId}`, {
       energy: serializeEnergyState(grantResult.state),
-      updatedAt: { _seconds: Math.floor(now.getTime() / 1000), _nanoseconds: 0 },
+      updatedAt: formatTimestamp(now),
     });
 
     return {

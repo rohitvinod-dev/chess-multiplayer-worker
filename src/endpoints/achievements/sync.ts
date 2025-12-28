@@ -11,6 +11,7 @@ import type {
   AchievementsSyncResponse,
   Achievement,
 } from '../../types/openings';
+import { formatTimestamp } from '../../utils/mastery';
 
 // Error codes
 const ErrorCodes = {
@@ -127,10 +128,11 @@ async function syncAchievementById(
   const achievementPath = `users/${userId}/achievements/${achievementId}`;
 
   // Simple format - just mark as unlocked with timestamp
+  const now = formatTimestamp(new Date());
   const achievementData = {
     id: achievementId,
-    unlockedAt: { _seconds: Math.floor(Date.now() / 1000), _nanoseconds: 0 },
-    lastUpdated: { _seconds: Math.floor(Date.now() / 1000), _nanoseconds: 0 },
+    unlockedAt: now,
+    lastUpdated: now,
   };
 
   // Use setDocument to create or update
@@ -155,7 +157,7 @@ async function syncAchievement(
     progress: achievement.progress || 0, // 0-100 scale (STANDARDIZE)
     currentValue: achievement.progress || 0, // RESTORE current value
     targetValue: achievement.target || null, // RENAME from "target"
-    lastUpdated: { _seconds: Math.floor(Date.now() / 1000), _nanoseconds: 0 },
+    lastUpdated: formatTimestamp(new Date()),
   };
 
   // Only include unlockedAt if the achievement is unlocked
@@ -179,6 +181,6 @@ async function updatePublicProfileAchievements(
   await firestore.updateDocument(publicDataPath, {
     unlockedAchievementIds: achievementIds,
     unlockedAchievementCount: achievementIds.length,
-    updatedAt: { _seconds: Math.floor(Date.now() / 1000), _nanoseconds: 0 },
+    updatedAt: formatTimestamp(new Date()),
   });
 }

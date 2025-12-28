@@ -68,9 +68,12 @@ export class LobbyRoom extends Server<LobbyRoomEnv> {
   gameRoomId?: string;
   gameWebSocketUrl?: string;
 
-  // Timeout tracking
-  timeoutId?: number;
-  maxWaitTimeMs = 5 * 60 * 1000; // 5 minutes
+  // Timeout tracking - use alarms instead of setTimeout (survives hibernation)
+  maxWaitTimeMs = 10 * 1000; // 10 seconds for testing (change to 5 * 60 * 1000 for production)
+
+  // Grace period before cancelling on disconnect (prevents race conditions)
+  disconnectGraceMs = 5000; // 5 seconds grace period
+  disconnectTimeoutId?: ReturnType<typeof setTimeout>;
 
   async onStart() {
     console.log(`[LobbyRoom] Starting lobby room`);
@@ -89,14 +92,88 @@ export class LobbyRoom extends Server<LobbyRoomEnv> {
       this.gameWebSocketUrl = stored.webSocketUrl;
 
       console.log(`[LobbyRoom] Loaded state for lobby ${this.lobbyId}, status: ${this.status}`);
-    }
 
-    // Start timeout timer
-    this.startTimeoutTimer();
+      // Check if lobby should have timed out while hibernating
+      if (this.status === 'waiting') {
+        const elapsed = Date.now() - this.createdAt;
+        if (elapsed > this.maxWaitTimeMs) {
+          console.log(`[LobbyRoom] Lobby ${this.lobbyId} expired during hibernation (${elapsed}ms)`);
+          await this.cancelAndRemoveFromList('Lobby expired');
+        }
+      }
+    }
   }
 
-  async onConnect(connection: Connection) {
-    const userId = new URL(connection.url).searchParams.get('userId');
+  /**
+   * Durable Object alarm handler - fires when timeout expires
+   * This survives hibernation unlike setTimeout!
+   */
+  async alarm() {
+    console.log(`[LobbyRoom] ⏰ ALARM FIRED for lobby ${this.lobbyId}, status: ${this.status}, createdAt: ${this.createdAt}`);
+
+    if (this.status !== 'waiting') {
+      console.log(`[LobbyRoom] Ignoring alarm - lobby is ${this.status}`);
+      return;
+    }
+
+    // Double-check elapsed time (alarm might have been delayed)
+    const elapsed = Date.now() - this.createdAt;
+    console.log(`[LobbyRoom] Elapsed time: ${elapsed}ms, max wait: ${this.maxWaitTimeMs}ms`);
+
+    if (elapsed >= this.maxWaitTimeMs) {
+      console.log(`[LobbyRoom] 🚫 Lobby ${this.lobbyId} timed out after ${elapsed}ms`);
+      await this.cancelAndRemoveFromList('No opponent found - lobby timed out');
+    } else {
+      // Alarm fired early, set another alarm for remaining time
+      const remaining = this.maxWaitTimeMs - elapsed;
+      console.log(`[LobbyRoom] Alarm fired early, setting new alarm for ${remaining}ms`);
+      await this.ctx.storage.setAlarm(Date.now() + remaining);
+    }
+  }
+
+  /**
+   * Check if lobby should be auto-cancelled due to timeout
+   * Called as a fallback in case alarm doesn't fire
+   */
+  private async checkAndCancelIfExpired(): Promise<boolean> {
+    if (this.status !== 'waiting') return false;
+
+    const elapsed = Date.now() - this.createdAt;
+    if (elapsed >= this.maxWaitTimeMs) {
+      console.log(`[LobbyRoom] 🚫 Fallback timeout check - lobby ${this.lobbyId} expired (${elapsed}ms)`);
+      await this.cancelAndRemoveFromList('No opponent found - lobby timed out');
+      return true;
+    }
+    return false;
+  }
+
+  async onConnect(connection: Connection, ctx: any) {
+    // Fallback timeout check in case alarm didn't fire
+    if (await this.checkAndCancelIfExpired()) {
+      connection.send(JSON.stringify({
+        type: 'lobby_cancelled',
+        reason: 'Lobby has expired',
+      }));
+      connection.close(1000, 'Lobby expired');
+      return;
+    }
+
+    // Parse userId from the request URL (same pattern as GameRoom)
+    // Note: ctx.request.url contains the full URL with query params
+    let userId: string | null = null;
+    try {
+      const url = new URL(ctx.request.url);
+      userId = url.searchParams.get('userId');
+    } catch (e) {
+      console.error(`[LobbyRoom] Failed to parse request URL:`, e);
+      // Fallback: try connection.url
+      try {
+        const url = new URL(connection.url, 'https://localhost');
+        userId = url.searchParams.get('userId');
+      } catch (e2) {
+        console.error(`[LobbyRoom] Failed to parse connection URL: ${connection.url}`, e2);
+      }
+    }
     console.log(`[LobbyRoom] User ${userId} connecting to lobby ${this.lobbyId}`);
 
     if (!userId) {
@@ -111,10 +188,34 @@ export class LobbyRoom extends Server<LobbyRoomEnv> {
     // Attach connection to creator or opponent
     if (userId === this.creatorId && this.creator) {
       this.creator.connection = connection;
-      console.log(`[LobbyRoom] Creator ${userId} connected`);
+      console.log(`[LobbyRoom] Creator ${userId} connected, status: ${this.status}`);
 
-      // Send current status
-      this.sendStatusUpdate(connection);
+      // Cancel any pending disconnect timeout (creator reconnected)
+      if (this.disconnectTimeoutId) {
+        clearTimeout(this.disconnectTimeoutId);
+        this.disconnectTimeoutId = undefined;
+        console.log(`[LobbyRoom] Creator reconnected, cancelled disconnect timeout`);
+      }
+
+      // CRITICAL: If lobby is already matched, send match_ready to creator
+      // This handles the case where creator's WebSocket was disconnected during matching
+      if (this.status === 'matched' && this.gameRoomId && this.gameWebSocketUrl && this.opponent) {
+        console.log(`[LobbyRoom] Creator reconnected after match - sending match_ready`);
+        connection.send(JSON.stringify({
+          type: 'match_ready',
+          roomId: this.gameRoomId,
+          webSocketUrl: this.gameWebSocketUrl,
+          playerColor: this.creatorColor,
+          opponent: {
+            id: this.opponent.id,
+            displayName: this.opponent.displayName,
+            rating: this.opponent.rating,
+          },
+        }));
+      } else {
+        // Send current status (waiting)
+        this.sendStatusUpdate(connection);
+      }
     } else if (this.opponent && userId === this.opponent.id) {
       this.opponent.connection = connection;
       console.log(`[LobbyRoom] Opponent ${userId} connected`);
@@ -136,6 +237,15 @@ export class LobbyRoom extends Server<LobbyRoomEnv> {
 
       switch (type) {
         case 'ping':
+          // Check for timeout on each ping (every 30 seconds from client)
+          if (await this.checkAndCancelIfExpired()) {
+            connection.send(JSON.stringify({
+              type: 'lobby_cancelled',
+              reason: 'Lobby has expired',
+            }));
+            connection.close(1000, 'Lobby expired');
+            return;
+          }
           connection.send(JSON.stringify({ type: 'pong' }));
           break;
 
@@ -156,7 +266,31 @@ export class LobbyRoom extends Server<LobbyRoomEnv> {
   }
 
   async onClose(connection: Connection) {
-    console.log(`[LobbyRoom] Connection closed`);
+    console.log(`[LobbyRoom] Connection closed for lobby ${this.lobbyId}, status: ${this.status}`);
+
+    // If creator disconnects while waiting, start grace period before cancelling
+    // This prevents race conditions when joiner is joining at the same moment
+    if (this.creator?.connection === connection && this.status === 'waiting') {
+      console.log(`[LobbyRoom] Creator disconnected, starting ${this.disconnectGraceMs}ms grace period before cancelling`);
+      this.creator.connection = undefined;
+
+      // Clear any existing timeout
+      if (this.disconnectTimeoutId) {
+        clearTimeout(this.disconnectTimeoutId);
+      }
+
+      // Start grace period - only cancel if still waiting after grace period
+      this.disconnectTimeoutId = setTimeout(async () => {
+        // Re-check status after grace period (might have been matched in the meantime)
+        if (this.status === 'waiting' && !this.creator?.connection) {
+          console.log(`[LobbyRoom] Grace period expired, cancelling lobby ${this.lobbyId}`);
+          await this.cancelAndRemoveFromList('Creator disconnected');
+        } else {
+          console.log(`[LobbyRoom] Grace period expired but status is ${this.status}, not cancelling`);
+        }
+      }, this.disconnectGraceMs);
+      return;
+    }
 
     // Remove connection reference
     if (this.creator?.connection === connection) {
@@ -168,8 +302,15 @@ export class LobbyRoom extends Server<LobbyRoomEnv> {
   }
 
   async onRequest(request: Request): Promise<Response> {
-    const url = new URL(request.url);
-    const pathname = url.pathname;
+    // Parse URL with fallback base for relative paths
+    let pathname: string;
+    try {
+      const url = new URL(request.url, 'https://localhost');
+      pathname = url.pathname;
+    } catch (e) {
+      console.error(`[LobbyRoom] Failed to parse request URL: ${request.url}`, e);
+      pathname = request.url; // Use raw URL as fallback
+    }
 
     console.log(`[LobbyRoom] HTTP request: ${request.method} ${pathname}`);
 
@@ -222,7 +363,10 @@ export class LobbyRoom extends Server<LobbyRoomEnv> {
 
       await this.persist();
 
-      console.log(`[LobbyRoom] Initialized lobby ${this.lobbyId}`);
+      // Set alarm for auto-timeout (survives hibernation!)
+      const alarmTime = Date.now() + this.maxWaitTimeMs;
+      await this.ctx.storage.setAlarm(alarmTime);
+      console.log(`[LobbyRoom] Initialized lobby ${this.lobbyId}, alarm set for ${new Date(alarmTime).toISOString()}`);
 
       return new Response(JSON.stringify({ success: true }), {
         headers: { 'Content-Type': 'application/json' },
@@ -235,6 +379,10 @@ export class LobbyRoom extends Server<LobbyRoomEnv> {
       });
     }
   }
+
+  // Store the determined colors once (to avoid random being called multiple times)
+  private creatorColor?: PlayerColor;
+  private opponentColor?: PlayerColor;
 
   private async handleJoin(request: Request): Promise<Response> {
     try {
@@ -261,7 +409,33 @@ export class LobbyRoom extends Server<LobbyRoomEnv> {
         connectedAt: Date.now(),
       };
 
-      // Notify creator via WebSocket
+      // CRITICAL FIX: Determine colors ONCE and cache them
+      // This prevents the random color assignment from giving different results
+      // when called multiple times during the join flow
+      this.assignPlayerColors();
+
+      // IMPORTANT: Set status to 'matched' IMMEDIATELY to prevent race condition
+      // If we set it after createGameRoom(), the onClose handler might fire
+      // during the async operation and cancel the lobby
+      this.status = 'matched';
+      await this.persist();
+
+      // Cancel any pending disconnect timeout (we're matching now!)
+      if (this.disconnectTimeoutId) {
+        clearTimeout(this.disconnectTimeoutId);
+        this.disconnectTimeoutId = undefined;
+        console.log(`[LobbyRoom] Cancelled disconnect timeout (matching)`);
+      }
+
+      // Clear the timeout alarm since we're matching
+      try {
+        await this.ctx.storage.deleteAlarm();
+        console.log(`[LobbyRoom] Cleared alarm for lobby ${this.lobbyId} (matching)`);
+      } catch (e) {
+        // Alarm might already be cleared
+      }
+
+      // Notify creator via WebSocket that opponent joined
       if (this.creator?.connection) {
         this.creator.connection.send(JSON.stringify({
           type: 'opponent_joined',
@@ -275,46 +449,75 @@ export class LobbyRoom extends Server<LobbyRoomEnv> {
         }));
       }
 
-      // Create game room
+      // Create game room first (sets gameRoomId and webSocketUrl)
       await this.createGameRoom();
 
-      // Update status
-      this.status = 'matched';
-      await this.persist();
+      // Now update LobbyList status to 'playing' with game room info
+      // (Must be AFTER createGameRoom so gameRoomId/webSocketUrl are set)
+      try {
+        const lobbyListId = this.env.LOBBY_LIST.idFromName('global');
+        const lobbyListStub = this.env.LOBBY_LIST.get(lobbyListId);
+
+        // Prepare player info based on colors
+        const isCreatorWhite = this.creatorColor === 'white';
+        const updatePayload: Record<string, unknown> = {
+          status: 'playing',
+          startedAt: Date.now(),
+          gameRoomId: this.gameRoomId,
+          webSocketUrl: this.gameWebSocketUrl,
+        };
+
+        // Add player info
+        if (isCreatorWhite) {
+          updatePayload.whitePlayerId = this.creator?.id;
+          updatePayload.whiteDisplayName = this.creator?.displayName;
+          updatePayload.whiteRating = this.creator?.rating;
+          updatePayload.blackPlayerId = this.opponent?.id;
+          updatePayload.blackDisplayName = this.opponent?.displayName;
+          updatePayload.blackRating = this.opponent?.rating;
+        } else {
+          updatePayload.blackPlayerId = this.creator?.id;
+          updatePayload.blackDisplayName = this.creator?.displayName;
+          updatePayload.blackRating = this.creator?.rating;
+          updatePayload.whitePlayerId = this.opponent?.id;
+          updatePayload.whiteDisplayName = this.opponent?.displayName;
+          updatePayload.whiteRating = this.opponent?.rating;
+        }
+
+        await lobbyListStub.fetch(new Request(`https://lobby-list/update/${this.lobbyId}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(updatePayload),
+        }));
+        console.log(`[LobbyRoom] Lobby ${this.lobbyId} updated to 'playing' in LobbyList (spectators can join)`);
+      } catch (e) {
+        console.error(`[LobbyRoom] Failed to update LobbyList status:`, e);
+      }
 
       // Notify creator that match is ready
       if (this.creator?.connection) {
-        const creatorColor = this.determinePlayerColor(true);
-        const opponentColor = creatorColor === 'white' ? 'black' : 'white';
-
         this.creator.connection.send(JSON.stringify({
           type: 'match_ready',
           roomId: this.gameRoomId,
           webSocketUrl: this.gameWebSocketUrl,
-          playerColor: creatorColor,
+          playerColor: this.creatorColor,
           opponent: {
             id: this.opponent.id,
             displayName: this.opponent.displayName,
             rating: this.opponent.rating,
           },
         }));
+        console.log(`[LobbyRoom] Sent match_ready to creator with color: ${this.creatorColor}`);
       }
 
-      // Clear timeout timer
-      if (this.timeoutId) {
-        clearTimeout(this.timeoutId);
-        this.timeoutId = undefined;
-      }
+      console.log(`[LobbyRoom] Opponent joined, game room created: ${this.gameRoomId}, creator: ${this.creatorColor}, opponent: ${this.opponentColor}`);
 
-      console.log(`[LobbyRoom] Opponent joined, game room created: ${this.gameRoomId}`);
-
-      // Return game info to joining player
-      const opponentColor = this.determinePlayerColor(false);
+      // Return game info to joining player (use cached color)
       return new Response(JSON.stringify({
         success: true,
         roomId: this.gameRoomId,
         webSocketUrl: this.gameWebSocketUrl,
-        playerColor: opponentColor,
+        playerColor: this.opponentColor,
         opponent: {
           id: this.creator!.id,
           displayName: this.creator!.displayName,
@@ -351,28 +554,61 @@ export class LobbyRoom extends Server<LobbyRoomEnv> {
   }
 
   private async handleCancel(): Promise<Response> {
-    this.status = 'cancelled';
-    await this.persist();
-
-    // Notify creator
-    if (this.creator?.connection) {
-      this.creator.connection.send(JSON.stringify({
-        type: 'lobby_cancelled',
-        reason: 'Cancelled by creator',
-      }));
-    }
-
-    // Clear timeout
-    if (this.timeoutId) {
-      clearTimeout(this.timeoutId);
-      this.timeoutId = undefined;
-    }
-
-    console.log(`[LobbyRoom] Lobby cancelled`);
+    await this.cancelAndRemoveFromList('Cancelled by creator');
 
     return new Response(JSON.stringify({ success: true }), {
       headers: { 'Content-Type': 'application/json' },
     });
+  }
+
+  /**
+   * Cancel lobby and remove from global LobbyList
+   */
+  private async cancelAndRemoveFromList(reason: string): Promise<void> {
+    if (this.status === 'cancelled') {
+      return; // Already cancelled
+    }
+
+    this.status = 'cancelled';
+    await this.persist();
+
+    // Clear the timeout alarm
+    try {
+      await this.ctx.storage.deleteAlarm();
+      console.log(`[LobbyRoom] Cleared alarm for lobby ${this.lobbyId} (cancelled)`);
+    } catch (e) {
+      // Alarm might already be cleared or not set
+    }
+
+    // Notify creator and close their connection
+    if (this.creator?.connection) {
+      this.creator.connection.send(JSON.stringify({
+        type: 'lobby_cancelled',
+        reason,
+      }));
+      // Close the WebSocket connection so client's onDone handler fires
+      try {
+        this.creator.connection.close(1000, reason);
+      } catch (e) {
+        console.error('[LobbyRoom] Error closing creator connection:', e);
+      }
+      this.creator.connection = undefined;
+    }
+
+    // Remove from global LobbyList
+    try {
+      const lobbyListId = this.env.LOBBY_LIST.idFromName('global');
+      const lobbyListStub = this.env.LOBBY_LIST.get(lobbyListId);
+
+      await lobbyListStub.fetch(new Request(`https://lobby-list/remove/${this.lobbyId}`, {
+        method: 'DELETE',
+      }));
+      console.log(`[LobbyRoom] Lobby ${this.lobbyId} removed from LobbyList`);
+    } catch (error) {
+      console.error('[LobbyRoom] Failed to remove from LobbyList:', error);
+    }
+
+    console.log(`[LobbyRoom] Lobby ${this.lobbyId} cancelled: ${reason}`);
   }
 
   private async handleLeave(connection: Connection): Promise<void> {
@@ -396,14 +632,15 @@ export class LobbyRoom extends Server<LobbyRoomEnv> {
     this.gameRoomId = crypto.randomUUID();
 
     // Create GameRoom Durable Object
-    const gameRoomId = this.ctx.env.GAME_ROOM.idFromName(this.gameRoomId);
-    const gameRoomStub = this.ctx.env.GAME_ROOM.get(gameRoomId);
+    const gameRoomId = this.env.GAME_ROOM.idFromName(this.gameRoomId);
+    const gameRoomStub = this.env.GAME_ROOM.get(gameRoomId);
 
-    // Determine colors
-    const creatorColor = this.determinePlayerColor(true);
-    const opponentColor = creatorColor === 'white' ? 'black' : 'white';
+    // Use cached colors (must be assigned before calling this method!)
+    if (!this.creatorColor || !this.opponentColor) {
+      throw new Error('Colors not assigned before createGameRoom');
+    }
 
-    // Initialize game room
+    // Initialize game room with cached colors
     const initRequest = {
       gameMode: this.settings.gameMode,
       isLobbyMode: true,
@@ -411,13 +648,13 @@ export class LobbyRoom extends Server<LobbyRoomEnv> {
       openingName: this.settings.openingName,
       startingFen: this.settings.openingFen,
       players: {
-        [creatorColor]: {
+        [this.creatorColor]: {
           id: this.creator!.id,
           displayName: this.creator!.displayName,
           rating: this.creator!.rating,
           isProvisional: this.creator!.isProvisional,
         },
-        [opponentColor]: {
+        [this.opponentColor]: {
           id: this.opponent!.id,
           displayName: this.opponent!.displayName,
           rating: this.opponent!.rating,
@@ -426,23 +663,57 @@ export class LobbyRoom extends Server<LobbyRoomEnv> {
       },
     };
 
+    console.log(`[LobbyRoom] Initializing GameRoom with colors: creator=${this.creatorColor}, opponent=${this.opponentColor}`);
+
     await gameRoomStub.fetch(new Request(`https://game-room/init`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(initRequest),
     }));
 
-    // Store WebSocket URL
-    this.gameWebSocketUrl = `wss://${this.ctx.url.host}/api/game/${this.gameRoomId}/ws`;
+    // Store WebSocket URL - use production URL as fallback
+    const host = this.ctx.url?.host || 'checkmatex-worker-production.rohitvinod-dev.workers.dev';
+    this.gameWebSocketUrl = `wss://${host}/parties/game-room/${this.gameRoomId}`;
 
     console.log(`[LobbyRoom] Game room created: ${this.gameRoomId}`);
   }
 
-  private determinePlayerColor(isCreator: boolean): PlayerColor {
+  /**
+   * Assign player colors ONCE and cache them.
+   * This must be called before createGameRoom or sending match_ready.
+   */
+  private assignPlayerColors(): void {
     const colorChoice = this.settings.playerColor;
 
     if (colorChoice === 'random') {
-      // Random assignment
+      // Random assignment - only called once!
+      const creatorIsWhite = Math.random() < 0.5;
+      this.creatorColor = creatorIsWhite ? 'white' : 'black';
+      this.opponentColor = creatorIsWhite ? 'black' : 'white';
+    } else if (colorChoice === 'white') {
+      this.creatorColor = 'white';
+      this.opponentColor = 'black';
+    } else {
+      this.creatorColor = 'black';
+      this.opponentColor = 'white';
+    }
+
+    console.log(`[LobbyRoom] Colors assigned: creator=${this.creatorColor}, opponent=${this.opponentColor}`);
+  }
+
+  /**
+   * @deprecated Use assignPlayerColors() and access this.creatorColor/this.opponentColor instead
+   */
+  private determinePlayerColor(isCreator: boolean): PlayerColor {
+    // Fallback for any legacy code - but colors should already be assigned
+    if (this.creatorColor && this.opponentColor) {
+      return isCreator ? this.creatorColor : this.opponentColor;
+    }
+
+    // Legacy behavior (should not be reached)
+    const colorChoice = this.settings.playerColor;
+
+    if (colorChoice === 'random') {
       const creatorIsWhite = Math.random() < 0.5;
       return isCreator
         ? (creatorIsWhite ? 'white' : 'black')
@@ -454,51 +725,31 @@ export class LobbyRoom extends Server<LobbyRoomEnv> {
     }
   }
 
-  private startTimeoutTimer(): void {
-    this.timeoutId = setTimeout(() => {
-      this.handleTimeout();
-    }, this.maxWaitTimeMs) as unknown as number;
-
-    console.log(`[LobbyRoom] Timeout timer started (${this.maxWaitTimeMs}ms)`);
-  }
-
-  private async handleTimeout(): Promise<void> {
-    if (this.status !== 'waiting') {
-      return; // Already matched or cancelled
-    }
-
-    console.log(`[LobbyRoom] Lobby timed out after ${this.maxWaitTimeMs}ms`);
-
-    this.status = 'cancelled';
-    await this.persist();
-
-    // Notify creator
-    if (this.creator?.connection) {
-      this.creator.connection.send(JSON.stringify({
-        type: 'lobby_cancelled',
-        reason: 'No opponent found within 5 minutes',
-      }));
-    }
-
-    // Update LobbyList to remove this lobby
-    try {
-      const lobbyListId = this.ctx.env.LOBBY_LIST.idFromName('global');
-      const lobbyListStub = this.ctx.env.LOBBY_LIST.get(lobbyListId);
-
-      await lobbyListStub.fetch(new Request(`https://lobby-list/remove/${this.lobbyId}`, {
-        method: 'POST',
-      }));
-    } catch (error) {
-      console.error('[LobbyRoom] Failed to remove from LobbyList:', error);
-    }
-  }
-
   private async persist(): Promise<void> {
+    // Exclude WebSocket connections from serialization (they can't be serialized)
+    const creatorForStorage = this.creator ? {
+      id: this.creator.id,
+      displayName: this.creator.displayName,
+      rating: this.creator.rating,
+      isProvisional: this.creator.isProvisional,
+      connectedAt: this.creator.connectedAt,
+      // connection is excluded - WebSocket objects cannot be serialized
+    } : undefined;
+
+    const opponentForStorage = this.opponent ? {
+      id: this.opponent.id,
+      displayName: this.opponent.displayName,
+      rating: this.opponent.rating,
+      isProvisional: this.opponent.isProvisional,
+      connectedAt: this.opponent.connectedAt,
+      // connection is excluded - WebSocket objects cannot be serialized
+    } : undefined;
+
     const state: LobbyState = {
       lobbyId: this.lobbyId,
       creatorId: this.creatorId,
-      creator: this.creator!,
-      opponent: this.opponent,
+      creator: creatorForStorage as LobbyParticipant,
+      opponent: opponentForStorage,
       settings: this.settings,
       status: this.status,
       createdAt: this.createdAt,

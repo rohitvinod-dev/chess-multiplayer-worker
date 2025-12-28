@@ -46,8 +46,8 @@ export interface LobbyInfo {
   spectatorCount: number;
   spectatorIds: string[];
 
-  // Game room connection
-  gameRoomId: string;
+  // Game room connection (only set when game starts)
+  gameRoomId?: string;
   webSocketUrl?: string;
 }
 

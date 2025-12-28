@@ -89,6 +89,9 @@ export type MoveRecord = {
   madeBy: PlayerColor;
 };
 
+// Match type to distinguish ranked vs friendly matches
+export type MatchType = "ranked" | "friendly";
+
 export type MatchHistoryData = {
   matchId: string;
   whitePlayer: {
@@ -104,11 +107,13 @@ export type MatchHistoryData = {
     isProvisional: boolean;
   };
   gameMode: GameMode;
+  matchType: MatchType; // "ranked" for ELO-affecting matches, "friendly" for lobby matches
   result: GameResult;
   resultReason: string;
   moves: MoveRecord[];
   startedAt: number;
   endedAt: number;
+  openingName?: string; // Optional: name of opening used (for lobby matches)
   eloChanges: {
     white: ELORatingChange;
     black: ELORatingChange;

@@ -24,9 +24,11 @@ export class LobbyList {
   private async initialize() {
     if (this.initialized) return;
 
-    const stored = await this.state.storage.get<Map<string, LobbyInfo>>('lobbies');
-    if (stored) {
+    // Storage returns [key, value][] array (serialized from Map entries)
+    const stored = await this.state.storage.get<[string, LobbyInfo][]>('lobbies');
+    if (stored && Array.isArray(stored)) {
       this.lobbies = new Map(stored);
+      console.log(`LobbyList loaded ${this.lobbies.size} lobbies from storage`);
     }
 
     this.initialized = true;
@@ -42,7 +44,7 @@ export class LobbyList {
     this.lobbies.set(lobby.id, lobby);
     await this.persist();
 
-    console.log(`Lobby ${lobby.id} added. Total lobbies: ${this.lobbies.size}`);
+    console.log(`Lobby ${lobby.id} added by ${lobby.creatorDisplayName}. isPrivate=${lobby.settings.isPrivate}. Total lobbies: ${this.lobbies.size}`);
   }
 
   /**
@@ -86,15 +88,20 @@ export class LobbyList {
     await this.initialize();
 
     let lobbies = Array.from(this.lobbies.values());
+    console.log(`getLobbies: Total in memory: ${lobbies.length}, filter: ${JSON.stringify(filter)}`);
 
     // Filter by status
     if (filter?.status) {
+      const beforeCount = lobbies.length;
       lobbies = lobbies.filter(l => l.status === filter.status);
+      console.log(`getLobbies: After status filter (${filter.status}): ${lobbies.length} (was ${beforeCount})`);
     }
 
     // Exclude private lobbies by default
     if (!filter?.includePrivate) {
+      const beforeCount = lobbies.length;
       lobbies = lobbies.filter(l => !l.settings.isPrivate);
+      console.log(`getLobbies: After private filter: ${lobbies.length} (was ${beforeCount})`);
     }
 
     // Sort: waiting lobbies first, then by creation time (newest first)
@@ -104,6 +111,7 @@ export class LobbyList {
       return b.createdAt - a.createdAt;
     });
 
+    console.log(`getLobbies: Returning ${lobbies.length} lobbies`);
     return lobbies;
   }
 
@@ -205,6 +213,47 @@ export class LobbyList {
     if (removed > 0) {
       await this.persist();
       console.log(`Cleaned up ${removed} finished lobbies`);
+    }
+
+    return removed;
+  }
+
+  /**
+   * Clear ALL lobbies (for admin/debug use)
+   */
+  async clearAllLobbies(): Promise<number> {
+    await this.initialize();
+
+    const count = this.lobbies.size;
+    this.lobbies.clear();
+    await this.persist();
+
+    console.log(`Cleared all ${count} lobbies from LobbyList`);
+    return count;
+  }
+
+  /**
+   * Clean up stale waiting lobbies (older than maxAgeMs)
+   */
+  async cleanupStaleLobbies(maxAgeMs: number = 10 * 60 * 1000): Promise<number> {
+    await this.initialize();
+
+    const now = Date.now();
+    let removed = 0;
+
+    for (const [id, lobby] of this.lobbies) {
+      const age = now - lobby.createdAt;
+      // Remove waiting lobbies older than maxAge, or any lobby older than 1 hour
+      if ((lobby.status === 'waiting' && age > maxAgeMs) || age > 60 * 60 * 1000) {
+        this.lobbies.delete(id);
+        removed++;
+        console.log(`Removed stale lobby ${id} (status: ${lobby.status}, age: ${Math.round(age / 1000)}s)`);
+      }
+    }
+
+    if (removed > 0) {
+      await this.persist();
+      console.log(`Cleaned up ${removed} stale lobbies`);
     }
 
     return removed;
@@ -325,6 +374,25 @@ export class LobbyList {
         const removed = await this.cleanupFinishedLobbies(maxAgeMs);
 
         return new Response(JSON.stringify({ removed }), {
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+
+      // POST /cleanup-stale - Cleanup stale waiting lobbies
+      if (path === '/cleanup-stale' && request.method === 'POST') {
+        const maxAgeMs = parseInt(url.searchParams.get('maxAgeMs') ?? '600000'); // 10 min default
+        const removed = await this.cleanupStaleLobbies(maxAgeMs);
+
+        return new Response(JSON.stringify({ removed }), {
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+
+      // DELETE /clear-all - Clear ALL lobbies (admin/debug)
+      if (path === '/clear-all' && request.method === 'DELETE') {
+        const removed = await this.clearAllLobbies();
+
+        return new Response(JSON.stringify({ removed, message: 'All lobbies cleared' }), {
           headers: { 'Content-Type': 'application/json' },
         });
       }

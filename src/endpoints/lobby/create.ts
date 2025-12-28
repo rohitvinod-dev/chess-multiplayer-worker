@@ -63,9 +63,14 @@ export async function createLobbyHandler(
     const lobbyRoomStub = env.LOBBY_ROOM.get(lobbyRoomId);
 
     // Initialize LobbyRoom with creator info
+    // PartyServer requires namespace and room headers for direct DO access
     await lobbyRoomStub.fetch(new Request('https://lobby-room/init', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'x-partykit-namespace': 'lobby-room',
+        'x-partykit-room': lobbyId,
+      },
       body: JSON.stringify({
         lobbyId,
         creatorId: userId,
@@ -110,7 +115,7 @@ export async function createLobbyHandler(
     const protocol = new URL(request.url).protocol === 'https:' ? 'wss:' : 'ws:';
     const host = request.headers.get('host') || 'localhost';
 
-    lobby.webSocketUrl = `${protocol}//${host}/api/lobby/${lobbyId}/ws?userId=${userId}`;
+    lobby.webSocketUrl = `${protocol}//${host}/parties/lobby-room/${lobbyId}?userId=${userId}`;
 
     console.log(`Created lobby ${lobbyId} with WebSocket waiting room (cost-efficient!)`);
 

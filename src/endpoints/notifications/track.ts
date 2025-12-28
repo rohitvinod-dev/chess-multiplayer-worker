@@ -11,6 +11,7 @@ import type { FirestoreClient } from '../../firestore';
 import type { AuthenticatedUser } from '../../types';
 import type { TrackNotificationOpenedRequest } from '../../types/notifications';
 import { ApiError, ErrorCodes } from '../../types';
+import { formatTimestamp } from '../../utils/mastery';
 
 export async function handleTrackNotificationOpened(
   request: Request,
@@ -48,8 +49,8 @@ export async function handleTrackNotificationOpened(
 
     // Update with opened timestamp
     await firestore.updateDocument(ledgerPath, {
-      openedAt: { _seconds: Math.floor(openedTimestamp.getTime() / 1000), _nanoseconds: 0 },
-      updatedAt: { _seconds: Math.floor(Date.now() / 1000), _nanoseconds: 0 },
+      openedAt: formatTimestamp(openedTimestamp),
+      updatedAt: formatTimestamp(new Date()),
     });
 
     // Record analytics event (for A/B testing and optimization)
@@ -61,12 +62,12 @@ export async function handleTrackNotificationOpened(
       templateId: ledgerEntry.templateId,
       experimentVariant: ledgerEntry.experimentVariant,
       sentAt: ledgerEntry.sentAt,
-      openedAt: { _seconds: Math.floor(openedTimestamp.getTime() / 1000), _nanoseconds: 0 },
+      openedAt: formatTimestamp(openedTimestamp),
       timeBetweenSentAndOpened: ledgerEntry.sentAt
-        ? Math.floor(openedTimestamp.getTime() / 1000) - ledgerEntry.sentAt._seconds
+        ? Math.floor((openedTimestamp.getTime() - new Date(ledgerEntry.sentAt).getTime()) / 1000)
         : null,
       metadata: ledgerEntry.metadata || {},
-      timestamp: { _seconds: Math.floor(Date.now() / 1000), _nanoseconds: 0 },
+      timestamp: formatTimestamp(new Date()),
     };
 
     // Store in analytics collection
@@ -80,7 +81,7 @@ export async function handleTrackNotificationOpened(
     return Response.json({
       success: true,
       notificationId,
-      openedAt: openedTimestamp.toISOString(),
+      openedAt: formatTimestamp(openedTimestamp),
     });
   } catch (error) {
     console.error('Error tracking notification:', error);

@@ -96,10 +96,27 @@ export class FirestoreClient {
 
   /**
    * Create or update a document in Firestore
+   * @param path - Document path (e.g., "users/uid123")
+   * @param data - Data to set
+   * @param options - Optional settings: { merge: true } to only update provided fields
    */
-  async setDocument(path: string, data: Record<string, any>): Promise<void> {
+  async setDocument(
+    path: string,
+    data: Record<string, any>,
+    options?: { merge?: boolean }
+  ): Promise<void> {
     const token = await this.getAccessToken();
-    const url = `https://firestore.googleapis.com/v1/projects/${this.projectId}/databases/(default)/documents/${path}`;
+    let url = `https://firestore.googleapis.com/v1/projects/${this.projectId}/databases/(default)/documents/${path}`;
+
+    // When merge is true, add updateMask to only update the provided fields
+    // Without updateMask, PATCH replaces the entire document (deleting unspecified fields)
+    if (options?.merge) {
+      const fieldPaths = this.getFieldPaths(data);
+      if (fieldPaths.length > 0) {
+        const maskParams = fieldPaths.map(field => `updateMask.fieldPaths=${encodeURIComponent(field)}`).join('&');
+        url += `?${maskParams}`;
+      }
+    }
 
     const firestoreDoc = this.encodeDocument(data);
 
@@ -121,7 +138,83 @@ export class FirestoreClient {
   }
 
   /**
+   * Extract top-level field paths from an object for updateMask
+   *
+   * IMPORTANT: We intentionally do NOT recurse into nested objects because:
+   * 1. Map fields like `explore_learnProgressMap` contain keys with special characters
+   *    (spaces, parentheses, dots) that require backtick-quoting in Firestore paths
+   * 2. For map fields, we want to replace the entire map, not individual keys
+   * 3. Using top-level paths is simpler and safer for our use case
+   *
+   * Example: { explore_learnProgressMap: { "Opening Name (5.e4)": 1 } }
+   * Returns: ["explore_learnProgressMap"] (NOT "explore_learnProgressMap.Opening Name (5.e4)")
+   */
+  private getFieldPaths(data: Record<string, any>): string[] {
+    // Return only top-level keys - do NOT recurse into nested objects
+    return Object.keys(data);
+  }
+
+  /**
+   * Update a single key within a map field without replacing the entire map.
+   * Uses Firestore's dot notation to merge instead of replace.
+   *
+   * @param docPath - Document path (e.g., "users/uid123")
+   * @param mapFieldName - Name of the map field (e.g., "focused_learnProgressMap")
+   * @param mapKey - Key within the map (e.g., "Italian Game_Var_SubVar")
+   * @param value - Value to set
+   */
+  async updateMapKey(
+    docPath: string,
+    mapFieldName: string,
+    mapKey: string,
+    value: any
+  ): Promise<void> {
+    const token = await this.getAccessToken();
+
+    // Escape special characters in map key with backticks for Firestore field path
+    const escapedKey = `\`${mapKey}\``;
+    const fieldPath = `${mapFieldName}.${escapedKey}`;
+
+    let url = `https://firestore.googleapis.com/v1/projects/${this.projectId}/databases/(default)/documents/${docPath}`;
+    url += `?updateMask.fieldPaths=${encodeURIComponent(fieldPath)}`;
+
+    // Build nested structure for the body
+    const body = {
+      fields: {
+        [mapFieldName]: {
+          mapValue: {
+            fields: {
+              [mapKey]: this.encodeValue(value)
+            }
+          }
+        }
+      }
+    };
+
+    const response = await fetch(url, {
+      method: 'PATCH',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    });
+
+    const responseBody = await response.text();
+
+    if (!response.ok) {
+      console.error(`[Firestore] updateMapKey failed for ${fieldPath}:`, responseBody);
+      throw new Error(`Firestore updateMapKey failed: ${response.statusText} - ${responseBody}`);
+    }
+
+    console.log(`[Firestore] Successfully updated ${mapFieldName}["${mapKey}"] = ${value}`);
+  }
+
+  /**
    * Update specific fields in a document
+   * IMPORTANT: This method automatically adds an updateMask to prevent deleting
+   * fields not included in the update. Without updateMask, Firestore PATCH
+   * replaces the entire document, which would delete fields like username, etc.
    */
   async updateDocument(
     path: string,
@@ -131,8 +224,11 @@ export class FirestoreClient {
     const token = await this.getAccessToken();
     let url = `https://firestore.googleapis.com/v1/projects/${this.projectId}/databases/(default)/documents/${path}`;
 
-    if (updateMask) {
-      const maskParams = updateMask.map(field => `updateMask.fieldPaths=${field}`).join('&');
+    // CRITICAL FIX: Always add updateMask to prevent deleting unspecified fields
+    // If no explicit mask provided, auto-generate from the data keys
+    const fieldsToUpdate = updateMask || this.getFieldPaths(data);
+    if (fieldsToUpdate.length > 0) {
+      const maskParams = fieldsToUpdate.map(field => `updateMask.fieldPaths=${encodeURIComponent(field)}`).join('&');
       url += `?${maskParams}`;
     }
 

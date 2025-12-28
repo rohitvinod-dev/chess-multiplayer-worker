@@ -5,6 +5,7 @@ import { handleRecordProgress } from './endpoints/progress/record';
 import { handleClaimEnergyReward } from './endpoints/progress/energy';
 import { handleEnsureUserProfile } from './endpoints/users/profile';
 import { handleRegisterDevice } from './endpoints/users/device';
+import { handleDeleteAccount } from './endpoints/users/delete-account';
 import { handleEnqueueNotification } from './endpoints/notifications/enqueue';
 import { handleUpdateNotificationPreferences } from './endpoints/notifications/preferences';
 import { handleTrackNotificationOpened } from './endpoints/notifications/track';
@@ -20,6 +21,8 @@ import { deleteLobbyHandler } from './endpoints/lobby/delete';
 import { enqueueLeaderboardCleanup, processCleanupBatch } from './cron/cleanup-leaderboards-queue';
 import { enqueueStreakReminders, processRemindersBatch } from './cron/daily-reminders-queue';
 import { enqueueLastChanceReminders, processLastChanceBatch } from './cron/last-chance-queue';
+// Direct processing cron jobs (FREE PLAN - works without queues!)
+import { sendStreakRemindersDirectly, sendLastChanceRemindersDirectly, cleanupLeaderboardsDirectly } from './cron/direct-reminders';
 import {
   type Connection,
   Server,
@@ -1059,6 +1062,13 @@ export default {
         return addCorsHeaders(response, corsHeaders);
       }
 
+      // Delete user account (deletes all Firestore data)
+      if (url.pathname === '/api/users/delete-account' && request.method === 'POST') {
+        const user = await authenticateRequest(request, env.FIREBASE_PROJECT_ID);
+        const response = await handleDeleteAccount(request, firestore, user);
+        return addCorsHeaders(response, corsHeaders);
+      }
+
       // ========== PROGRESS TRACKING ENDPOINTS (Phase 2) ==========
 
       // Record progress event
@@ -1119,7 +1129,7 @@ export default {
       // Create lobby
       if (url.pathname === '/api/lobby/create' && request.method === 'POST') {
         const user = await authenticateRequest(request, env.FIREBASE_PROJECT_ID);
-        const response = await createLobbyHandler(request, env, user);
+        const response = await createLobbyHandler(request, env, user.uid);
         return addCorsHeaders(response, corsHeaders);
       }
 
@@ -1132,23 +1142,59 @@ export default {
       // Join lobby
       if (url.pathname === '/api/lobby/join' && request.method === 'POST') {
         const user = await authenticateRequest(request, env.FIREBASE_PROJECT_ID);
-        const response = await joinLobbyHandler(request, env, user);
+        const response = await joinLobbyHandler(request, env, user.uid);
         return addCorsHeaders(response, corsHeaders);
       }
 
       // Spectate lobby
       if (url.pathname === '/api/lobby/spectate' && request.method === 'POST') {
         const user = await authenticateRequest(request, env.FIREBASE_PROJECT_ID);
-        const response = await spectateLobbyHandler(request, env, user);
+        const response = await spectateLobbyHandler(request, env, user.uid);
         return addCorsHeaders(response, corsHeaders);
       }
 
       // Delete lobby
-      if (url.pathname.startsWith('/api/lobby/') && request.method === 'DELETE') {
+      if (url.pathname.startsWith('/api/lobby/') && url.pathname !== '/api/lobby/clear-all' && request.method === 'DELETE') {
         const user = await authenticateRequest(request, env.FIREBASE_PROJECT_ID);
         const lobbyId = url.pathname.split('/')[3];
-        const response = await deleteLobbyHandler(request, env, user, lobbyId);
+        const response = await deleteLobbyHandler(request, env, user.uid, lobbyId);
         return addCorsHeaders(response, corsHeaders);
+      }
+
+      // Clear all lobbies (admin/debug endpoint)
+      if (url.pathname === '/api/lobby/clear-all' && request.method === 'DELETE') {
+        // Get LobbyList Durable Object
+        const lobbyListId = env.LOBBY_LIST.idFromName('global');
+        const lobbyListStub = env.LOBBY_LIST.get(lobbyListId);
+
+        // Call clear-all endpoint
+        const response = await lobbyListStub.fetch(new Request('https://lobby-list/clear-all', {
+          method: 'DELETE',
+        }));
+
+        const result = await response.json();
+        return new Response(JSON.stringify(result), {
+          status: 200,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        });
+      }
+
+      // Cleanup stale lobbies
+      if (url.pathname === '/api/lobby/cleanup-stale' && request.method === 'POST') {
+        // Get LobbyList Durable Object
+        const lobbyListId = env.LOBBY_LIST.idFromName('global');
+        const lobbyListStub = env.LOBBY_LIST.get(lobbyListId);
+
+        // Call cleanup-stale endpoint
+        const response = await lobbyListStub.fetch(new Request('https://lobby-list/cleanup-stale', {
+          method: 'POST',
+        }));
+
+        const result = await response.json();
+        return new Response(JSON.stringify(result), {
+          status: 200,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        });
       }
 
       // ========== STATS ENDPOINTS ==========
@@ -1189,7 +1235,7 @@ export default {
     }
   },
 
-  // ========== SCHEDULED CRON JOBS (Phase 5 - Queue-Based, Scalable to Millions!) ==========
+  // ========== SCHEDULED CRON JOBS (Phase 5 - Direct Processing for Free Plan) ==========
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
     console.log(`[Cron] Triggered at ${new Date(event.scheduledTime).toISOString()}`);
     console.log(`[Cron] Cron expression: ${event.cron}`);
@@ -1197,31 +1243,64 @@ export default {
     // Initialize Firestore client
     const firestore = new FirestoreClient(env.FIREBASE_SERVICE_ACCOUNT, env.FIREBASE_PROJECT_ID);
 
+    // Check if queues are available (paid plan feature)
+    const queuesAvailable = env.CLEANUP_QUEUE && env.REMINDERS_QUEUE && env.LAST_CHANCE_QUEUE;
+
     try {
-      // LIGHTWEIGHT cron jobs that only enqueue messages
-      // Actual processing happens in queue consumers (parallel batches)
       switch (event.cron) {
         case '0 2 * * *': {
-          // 2 AM UTC - Daily leaderboard cleanup (enqueue entries)
-          console.log('[Cron] Enqueuing leaderboard entries for cleanup...');
-          const result = await enqueueLeaderboardCleanup(firestore, env.CLEANUP_QUEUE);
-          console.log(`[Cron] Cleanup enqueue result:`, result);
+          // 2 AM UTC - Daily leaderboard cleanup + lobby cleanup
+          if (queuesAvailable) {
+            console.log('[Cron] Using queue-based cleanup (paid plan)...');
+            const result = await enqueueLeaderboardCleanup(firestore, env.CLEANUP_QUEUE);
+            console.log(`[Cron] Cleanup enqueue result:`, result);
+          } else {
+            console.log('[Cron] Using direct cleanup (free plan)...');
+            const result = await cleanupLeaderboardsDirectly(firestore);
+            console.log(`[Cron] Direct cleanup result:`, result);
+          }
+
+          // Also cleanup stale lobbies
+          try {
+            console.log('[Cron] Cleaning up stale lobbies...');
+            const lobbyListId = env.LOBBY_LIST.idFromName('global');
+            const lobbyListStub = env.LOBBY_LIST.get(lobbyListId);
+            const cleanupResult = await lobbyListStub.fetch(new Request('https://lobby-list/cleanup-stale', {
+              method: 'POST',
+            }));
+            const cleanupData = await cleanupResult.json() as { removed: number };
+            console.log(`[Cron] Lobby cleanup: ${cleanupData.removed} stale lobbies removed`);
+          } catch (e) {
+            console.error('[Cron] Lobby cleanup failed:', e);
+          }
           break;
         }
 
         case '0 9 * * *': {
-          // 9 AM UTC - Daily streak reminders (enqueue users)
-          console.log('[Cron] Enqueuing users for streak reminders...');
-          const result = await enqueueStreakReminders(firestore, env.REMINDERS_QUEUE);
-          console.log(`[Cron] Reminders enqueue result:`, result);
+          // 9 AM UTC - Daily streak reminders
+          if (queuesAvailable) {
+            console.log('[Cron] Using queue-based reminders (paid plan)...');
+            const result = await enqueueStreakReminders(firestore, env.REMINDERS_QUEUE);
+            console.log(`[Cron] Reminders enqueue result:`, result);
+          } else {
+            console.log('[Cron] Using direct reminders (free plan)...');
+            const result = await sendStreakRemindersDirectly(firestore, env);
+            console.log(`[Cron] Direct reminders result:`, result);
+          }
           break;
         }
 
         case '0 21 * * *': {
-          // 9 PM UTC - Last-chance streak savers (enqueue users)
-          console.log('[Cron] Enqueuing users for last-chance reminders...');
-          const result = await enqueueLastChanceReminders(firestore, env.LAST_CHANCE_QUEUE);
-          console.log(`[Cron] Last-chance enqueue result:`, result);
+          // 9 PM UTC - Last-chance streak savers
+          if (queuesAvailable) {
+            console.log('[Cron] Using queue-based last-chance (paid plan)...');
+            const result = await enqueueLastChanceReminders(firestore, env.LAST_CHANCE_QUEUE);
+            console.log(`[Cron] Last-chance enqueue result:`, result);
+          } else {
+            console.log('[Cron] Using direct last-chance (free plan)...');
+            const result = await sendLastChanceRemindersDirectly(firestore, env);
+            console.log(`[Cron] Direct last-chance result:`, result);
+          }
           break;
         }
 

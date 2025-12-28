@@ -16,6 +16,7 @@ import {
   validateVariationName,
   validateMoves,
 } from '../../types/openings';
+import { formatTimestamp } from '../../utils/mastery';
 
 // Error codes
 const ErrorCodes = {
@@ -119,7 +120,7 @@ async function handleCreateOpening(
   }
 
   // Create new opening
-  const now = { _seconds: Math.floor(Date.now() / 1000), _nanoseconds: 0 };
+  const now = formatTimestamp(new Date());
   const openingId = `opening_${Date.now()}`;
 
   const newOpening: any = {
@@ -186,7 +187,7 @@ async function handleRenameOpening(
   }
 
   // Update opening name
-  const now = { _seconds: Math.floor(Date.now() / 1000), _nanoseconds: 0 };
+  const now = formatTimestamp(new Date());
   await firestore.updateDocument(`users/${userId}/custom_openings/${body.openingId}`, {
     name: body.newName.trim(),
     updatedAt: now,
@@ -300,7 +301,7 @@ async function handleCreateVariation(
   }
 
   // Create new variation
-  const now = { _seconds: Math.floor(Date.now() / 1000), _nanoseconds: 0 };
+  const now = formatTimestamp(new Date());
   const variationId = `var_${Date.now()}`;
 
   const newVariation: any = {
@@ -422,7 +423,7 @@ async function handleUpdateVariation(
   }
 
   // Add updatedAt timestamp
-  updates.updatedAt = { _seconds: Math.floor(Date.now() / 1000), _nanoseconds: 0 };
+  updates.updatedAt = formatTimestamp(new Date());
 
   // Update variation
   await firestore.updateDocument(
@@ -475,7 +476,7 @@ async function handleDeleteVariation(
   );
 
   // Update opening variation count
-  const now = { _seconds: Math.floor(Date.now() / 1000), _nanoseconds: 0 };
+  const now = formatTimestamp(new Date());
   const existingVariations = await firestore.queryDocuments(
     `users/${userId}/custom_openings/${openingId}/variations`,
     []

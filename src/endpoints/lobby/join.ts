@@ -31,9 +31,14 @@ export async function joinLobbyHandler(
     // 1. Notify creator via WebSocket (real-time!)
     // 2. Create game room
     // 3. Return game info to both players
+    // PartyServer requires namespace and room headers for direct DO access
     const joinResponse = await lobbyRoomStub.fetch(new Request('https://lobby-room/join', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'x-partykit-namespace': 'lobby-room',
+        'x-partykit-room': body.lobbyId,
+      },
       body: JSON.stringify({
         playerId: userId,
         displayName: body.playerDisplayName,

@@ -22,6 +22,7 @@ import {
 import { checkPolicy } from '../../utils/policy-engine';
 import { sendFCM } from '../../utils/fcm';
 import { ApiError, ErrorCodes } from '../../types';
+import { formatTimestamp } from '../../utils/mastery';
 
 export async function handleEnqueueNotification(
   request: Request,
@@ -75,13 +76,13 @@ export async function handleEnqueueNotification(
         category: trigger.category,
         status: 'blocked',
         blockReason: policyResult.reason,
-        scheduledAt: { _seconds: Math.floor(scheduleAt.getTime() / 1000), _nanoseconds: 0 },
+        scheduledAt: formatTimestamp(scheduleAt),
         metadata: {
           ...metadata,
           isTransactional: trigger.isTransactional,
           priority: trigger.priority,
         },
-        createdAt: { _seconds: Math.floor(Date.now() / 1000), _nanoseconds: 0 },
+        createdAt: formatTimestamp(new Date()),
       };
 
       await firestore.setDocument(
@@ -124,7 +125,7 @@ export async function handleEnqueueNotification(
       category: trigger.category,
       templateId: variant.id,
       experimentVariant: variant.id,
-      scheduledAt: { _seconds: Math.floor(scheduleAt.getTime() / 1000), _nanoseconds: 0 },
+      scheduledAt: formatTimestamp(scheduleAt),
       status: 'scheduled',
       metadata: {
         ...metadata,
@@ -134,7 +135,7 @@ export async function handleEnqueueNotification(
       deepLink,
       title,
       body: body_text,
-      createdAt: { _seconds: Math.floor(now.getTime() / 1000), _nanoseconds: 0 },
+      createdAt: formatTimestamp(now),
     };
 
     await firestore.setDocument(`notification_ledger/${notificationId}`, ledgerEntry);
@@ -159,7 +160,7 @@ export async function handleEnqueueNotification(
     const response: EnqueueNotificationResponse = {
       enqueued: true,
       notificationId,
-      scheduledAt: scheduleAt.toISOString(),
+      scheduledAt: formatTimestamp(scheduleAt),
       variant: variant.id,
     };
 
@@ -202,7 +203,7 @@ async function sendNotificationNow(
       await firestore.updateDocument(`notification_ledger/${notificationId}`, {
         status: 'failed',
         failureReason: 'no_fcm_token',
-        updatedAt: { _seconds: Math.floor(Date.now() / 1000), _nanoseconds: 0 },
+        updatedAt: formatTimestamp(new Date()),
       });
       return;
     }
@@ -229,9 +230,9 @@ async function sendNotificationNow(
       // Update ledger
       await firestore.updateDocument(`notification_ledger/${notificationId}`, {
         status: 'sent',
-        sentAt: { _seconds: Math.floor(Date.now() / 1000), _nanoseconds: 0 },
+        sentAt: formatTimestamp(new Date()),
         fcmMessageId: result.messageId,
-        updatedAt: { _seconds: Math.floor(Date.now() / 1000), _nanoseconds: 0 },
+        updatedAt: formatTimestamp(new Date()),
       });
     } else {
       console.error('FCM send failed:', result.error);
@@ -240,7 +241,7 @@ async function sendNotificationNow(
       await firestore.updateDocument(`notification_ledger/${notificationId}`, {
         status: 'failed',
         failureReason: result.error,
-        updatedAt: { _seconds: Math.floor(Date.now() / 1000), _nanoseconds: 0 },
+        updatedAt: formatTimestamp(new Date()),
       });
     }
   } catch (error) {
@@ -250,7 +251,7 @@ async function sendNotificationNow(
     await firestore.updateDocument(`notification_ledger/${notificationId}`, {
       status: 'failed',
       failureReason: String(error),
-      updatedAt: { _seconds: Math.floor(Date.now() / 1000), _nanoseconds: 0 },
+      updatedAt: formatTimestamp(new Date()),
     });
   }
 }

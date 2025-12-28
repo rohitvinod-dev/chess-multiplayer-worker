@@ -45,7 +45,9 @@ export interface ProgressStats {
   totalVariations: number;
   openingsMasteredCount: number;
   totalOpeningsCount: number;
-  overallMasteryPercentage: number; // 0-100
+  overallMasteryPercentage: number; // 0-100, combined across both modes
+  focusedMasteryPercentage?: number; // 0-100, focused mode only (optional for legacy)
+  exploreMasteryPercentage?: number; // 0-100, explore mode only (optional for legacy)
   strongestOpening: string;
   weakestOpening: string;
 }
@@ -71,7 +73,8 @@ export interface RecordProgressEventRequest {
   newLevel?: number;
   delta?: number;
   eventId?: string;
-  mode?: TrainingMode; // NEW: Training mode (focused vs explore)
+  mode?: TrainingMode; // Training mode (focused vs explore)
+  totalSystemLines?: number; // Total lines in system (for accurate % calculation)
 }
 
 export interface RecordProgressEventResponse {

@@ -11,6 +11,7 @@
 
 import type { FirestoreClient } from '../firestore';
 import type { LeaderboardType } from '../types/openings';
+import { formatTimestamp } from './mastery';
 
 // ============ LEADERBOARD SYNC FUNCTIONS ============
 
@@ -146,7 +147,7 @@ async function syncToEloLeaderboard(
     losses: data.losses !== undefined ? data.losses : (existingEntry?.losses || 0),
     draws: data.draws !== undefined ? data.draws : (existingEntry?.draws || 0),
     totalGames: data.totalGames !== undefined ? data.totalGames : (existingEntry?.totalGames || 0),
-    updatedAt: { _seconds: Math.floor(Date.now() / 1000), _nanoseconds: 0 },
+    updatedAt: formatTimestamp(new Date()),
   };
 
   await firestore.setDocument(entryPath, entryData, { merge: true });
@@ -179,7 +180,7 @@ async function syncToTacticalLeaderboard(
     rank: null, // Computed by cron job
     puzzlesSolved: data.puzzlesSolved !== undefined ? data.puzzlesSolved : (existingEntry?.puzzlesSolved || 0),
     accuracy: data.accuracy !== undefined ? data.accuracy : (existingEntry?.accuracy || 0),
-    updatedAt: { _seconds: Math.floor(Date.now() / 1000), _nanoseconds: 0 },
+    updatedAt: formatTimestamp(new Date()),
   };
 
   await firestore.setDocument(entryPath, entryData, { merge: true });
@@ -216,7 +217,7 @@ async function syncToMasteryLeaderboard(
     totalVariations: data.totalVariations !== undefined ? data.totalVariations : (existingEntry?.totalVariations || 0),
     openingsMasteredCount: data.openingsMasteredCount !== undefined ? data.openingsMasteredCount : (existingEntry?.openingsMasteredCount || 0),
     totalOpeningsCount: data.totalOpeningsCount !== undefined ? data.totalOpeningsCount : (existingEntry?.totalOpeningsCount || 0),
-    updatedAt: { _seconds: Math.floor(Date.now() / 1000), _nanoseconds: 0 },
+    updatedAt: formatTimestamp(new Date()),
   };
 
   await firestore.setDocument(entryPath, entryData, { merge: true });
@@ -251,9 +252,9 @@ async function syncToStreakLeaderboard(
     highestStreak: data.highestStreak !== undefined ? data.highestStreak : (existingEntry?.highestStreak || data.currentStreak || 0),
     totalSessions: data.totalSessions !== undefined ? data.totalSessions : (existingEntry?.totalSessions || 0),
     lastSessionDate: data.lastSessionDate !== undefined
-      ? { _seconds: Math.floor(data.lastSessionDate / 1000), _nanoseconds: 0 }
-      : (existingEntry?.lastSessionDate || { _seconds: Math.floor(Date.now() / 1000), _nanoseconds: 0 }),
-    updatedAt: { _seconds: Math.floor(Date.now() / 1000), _nanoseconds: 0 },
+      ? new Date(data.lastSessionDate).toISOString()
+      : (existingEntry?.lastSessionDate || formatTimestamp(new Date())),
+    updatedAt: formatTimestamp(new Date()),
   };
 
   await firestore.setDocument(entryPath, entryData, { merge: true });

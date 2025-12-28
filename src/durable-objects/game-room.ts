@@ -40,7 +40,7 @@ interface SpectatorSession {
 // Task 5: Heartbeat configuration
 const HEARTBEAT_INTERVAL_MS = 10000; // 10 seconds
 const HEARTBEAT_TIMEOUT_MS = 30000; // 30 seconds without response = disconnect
-const RECONNECT_TIMEOUT_MS = 10000; // 10 seconds to reconnect before abandonment
+const RECONNECT_TIMEOUT_MS = 60000; // 60 seconds (1 minute) to reconnect before abandonment
 
 // Define Env type for GameRoom
 interface GameRoomEnv {
@@ -102,6 +102,170 @@ export class GameRoom extends Server<GameRoomEnv> {
 
     // Task 5: Start heartbeat monitoring for all connected players
     this.startHeartbeatMonitoring();
+  }
+
+  /**
+   * Override fetch to handle DO-to-DO HTTP calls before partyserver routing.
+   * Partyserver expects namespace/room headers for WebSocket connections,
+   * but we need to handle plain HTTP requests from LobbyRoom.
+   */
+  async fetch(request: Request): Promise<Response> {
+    // Check if this is a DO-to-DO call (no partyserver headers)
+    const hasPartyHeaders = request.headers.has('x-partykit-namespace') ||
+                            request.headers.has('x-partykit-room');
+
+    if (!hasPartyHeaders) {
+      // Handle as plain HTTP request (DO-to-DO call)
+      return this.handleHttpRequest(request);
+    }
+
+    // Delegate to partyserver for WebSocket handling
+    return super.fetch(request);
+  }
+
+  /**
+   * Handle HTTP requests (for DO-to-DO calls like lobby initialization)
+   * This allows LobbyRoom to initialize GameRoom before players connect via WebSocket
+   */
+  private async handleHttpRequest(request: Request): Promise<Response> {
+    let pathname: string;
+    try {
+      const url = new URL(request.url, 'https://localhost');
+      pathname = url.pathname;
+    } catch (e) {
+      console.error(`[GameRoom] Failed to parse request URL: ${request.url}`, e);
+      pathname = request.url;
+    }
+
+    console.log(`[GameRoom] HTTP request: ${request.method} ${pathname}`);
+
+    // Initialize game room (called by LobbyRoom when match is ready)
+    if (pathname === '/init' && request.method === 'POST') {
+      return this.handleInit(request);
+    }
+
+    // Get game state
+    if (pathname === '/state' && request.method === 'GET') {
+      return new Response(JSON.stringify({
+        gameStatus: this.gameStatus,
+        gameMode: this.gameMode,
+        isLobbyMode: this.isLobbyMode,
+        isUnrated: this.isUnrated,
+        players: Array.from(this.players.values()).map(p => ({
+          id: p.id,
+          displayName: p.displayName,
+          color: p.color,
+          connected: p.connected,
+        })),
+      }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
+    return new Response('Not Found', { status: 404 });
+  }
+
+  /**
+   * Initialize game room from LobbyRoom
+   * Sets up players, game mode, and lobby-specific settings
+   */
+  private async handleInit(request: Request): Promise<Response> {
+    try {
+      const data = await request.json() as {
+        gameMode: GameMode;
+        isLobbyMode: boolean;
+        isUnrated: boolean;
+        openingName?: string;
+        startingFen?: string;
+        players: {
+          white?: { id: string; displayName: string; rating: number; isProvisional: boolean };
+          black?: { id: string; displayName: string; rating: number; isProvisional: boolean };
+        };
+      };
+
+      console.log(`[GameRoom] Initializing from lobby:`, JSON.stringify(data));
+
+      // Set game configuration
+      this.gameMode = data.gameMode;
+      this.isLobbyMode = data.isLobbyMode;
+      // Lobby matches are always unrated (friendly matches)
+      this.isUnrated = true;
+      this.openingName = data.openingName;
+
+      if (data.startingFen) {
+        this.startingFen = data.startingFen;
+        this.gameState.fen = data.startingFen;
+      }
+
+      // Set clock based on game mode
+      const clockSettings = this.getClockSettings(data.gameMode);
+      this.clock = {
+        white: { remaining: clockSettings.initial, increment: clockSettings.increment },
+        black: { remaining: clockSettings.initial, increment: clockSettings.increment },
+        lastUpdate: Date.now(),
+        currentTurn: "white",
+      };
+
+      // Pre-register players (they'll connect via WebSocket later)
+      if (data.players.white) {
+        const white = data.players.white;
+        this.players.set(white.id, {
+          id: white.id,
+          displayName: white.displayName,
+          rating: white.rating,
+          isProvisional: white.isProvisional,
+          color: "white",
+          lastSeen: Date.now(),
+          connected: false,
+          ready: false,
+        });
+      }
+
+      if (data.players.black) {
+        const black = data.players.black;
+        this.players.set(black.id, {
+          id: black.id,
+          displayName: black.displayName,
+          rating: black.rating,
+          isProvisional: black.isProvisional,
+          color: "black",
+          lastSeen: Date.now(),
+          connected: false,
+          ready: false,
+        });
+      }
+
+      this.gameStatus = "waiting";
+      console.log(`[GameRoom] Initialized successfully. Players: ${this.players.size}, Mode: ${this.gameMode}, Unrated: ${this.isUnrated}`);
+
+      return new Response(JSON.stringify({ success: true }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    } catch (error) {
+      console.error('[GameRoom] Init error:', error);
+      return new Response(JSON.stringify({ error: 'Failed to initialize game room' }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+  }
+
+  /**
+   * Get clock settings based on game mode
+   */
+  private getClockSettings(mode: GameMode): { initial: number; increment: number } {
+    switch (mode) {
+      case "bullet":
+        return { initial: 60000, increment: 0 }; // 1 minute
+      case "blitz":
+        return { initial: 180000, increment: 1000 }; // 3+1
+      case "rapid":
+        return { initial: 600000, increment: 5000 }; // 10+5
+      case "classical":
+        return { initial: 1800000, increment: 10000 }; // 30+10
+      default:
+        return { initial: 180000, increment: 1000 }; // Default to blitz
+    }
   }
 
   onConnect(connection: Connection, ctx: any) {
@@ -274,6 +438,10 @@ export class GameRoom extends Server<GameRoomEnv> {
         case "ready":
           this.handlePlayerReady(sendingPlayer);
           break;
+        // Handle client-reported game end (checkmate, stalemate, draw)
+        case "game_end":
+          this.handleGameEndRequest(sendingPlayer, data);
+          break;
       }
     } catch (error) {
       console.error("Error handling message:", error);
@@ -329,12 +497,17 @@ export class GameRoom extends Server<GameRoomEnv> {
 
     // Set clock based on game mode
     this.setClock(this.gameMode);
+    // IMPORTANT: Reset lastUpdate to now, otherwise the first clock tick will see
+    // a huge elapsed time (from when the room was initialized until now)
+    this.clock.lastUpdate = Date.now();
+    this.clock.currentTurn = "white"; // Ensure white starts
 
     // Initialize match tracking
     this.matchStartTime = Date.now();
     this.moveHistory = [];
 
     // Start clock interval
+    console.log(`GameRoom: Starting clock interval with white: ${this.clock.white.remaining}ms, black: ${this.clock.black.remaining}ms`);
     this.startClockInterval();
 
     // Send ready message to both players
@@ -493,6 +666,72 @@ export class GameRoom extends Server<GameRoomEnv> {
     this.endGame(result, "resignation");
   }
 
+  /**
+   * Handle client-reported game end (checkmate, stalemate, draw conditions)
+   * The client (Flutter) detects these conditions using chess.dart library
+   * and sends a game_end message to the server
+   */
+  private handleGameEndRequest(player: PlayerSession, data: any) {
+    console.log(`GameRoom: >>> handleGameEndRequest received from player ${player.id} (${player.color})`);
+    console.log(`GameRoom: >>> data: ${JSON.stringify(data)}`);
+
+    if (this.gameStatus !== "playing") {
+      console.log(`GameRoom: Ignoring game_end request - game status is ${this.gameStatus}`);
+      return;
+    }
+
+    const { result, reason, fen } = data as {
+      result: "white_win" | "black_win" | "draw";
+      reason: string;
+      fen?: string;
+    };
+
+    // Validate result and reason
+    const validResults = ["white_win", "black_win", "draw"];
+    const validReasons = ["checkmate", "stalemate", "insufficient_material", "threefold_repetition", "fifty_move_rule"];
+
+    if (!validResults.includes(result)) {
+      console.error(`GameRoom: Invalid game_end result: ${result}`);
+      player.connection?.send(JSON.stringify({
+        type: "error",
+        code: "invalid_game_end",
+        message: "Invalid game end result",
+      }));
+      return;
+    }
+
+    if (!validReasons.includes(reason)) {
+      console.error(`GameRoom: Invalid game_end reason: ${reason}`);
+      player.connection?.send(JSON.stringify({
+        type: "error",
+        code: "invalid_game_end",
+        message: "Invalid game end reason",
+      }));
+      return;
+    }
+
+    // For checkmate, validate that the reporting player's color matches the result
+    // The player whose turn it is when checkmate occurs is the one who LOST
+    if (reason === "checkmate") {
+      // The winner is the player who delivered checkmate (not their turn anymore)
+      // So if white_win, it means black's king is in checkmate (black's turn when game ended)
+      const expectedWinner = result === "white_win" ? "white" : "black";
+
+      // Log but allow - trust the client's chess.dart library for validation
+      console.log(`GameRoom: Checkmate reported by ${player.color}, result: ${result}, winner: ${expectedWinner}`);
+    }
+
+    // Update FEN if provided
+    if (fen) {
+      this.gameState.fen = fen;
+    }
+
+    console.log(`GameRoom: Game ended by client request - result: ${result}, reason: ${reason}`);
+    console.log(`GameRoom: >>> Calling endGame now...`);
+    this.endGame(result, reason);
+    console.log(`GameRoom: >>> endGame completed`);
+  }
+
   private handleChat(player: PlayerSession, message: string) {
     const chatMessage: GameMessage = {
       type: "chat",
@@ -523,12 +762,16 @@ export class GameRoom extends Server<GameRoomEnv> {
       if (this.clock.currentTurn === "white") {
         this.clock.white.remaining -= elapsed;
         if (this.clock.white.remaining <= 0) {
+          console.log(`GameRoom: White time expired! Remaining: ${this.clock.white.remaining}ms`);
           this.endGame("black_win", "timeout");
+          return; // Stop processing after game ends
         }
       } else {
         this.clock.black.remaining -= elapsed;
         if (this.clock.black.remaining <= 0) {
+          console.log(`GameRoom: Black time expired! Remaining: ${this.clock.black.remaining}ms`);
           this.endGame("white_win", "timeout");
+          return; // Stop processing after game ends
         }
       }
 
@@ -633,45 +876,88 @@ export class GameRoom extends Server<GameRoomEnv> {
     const white = players.find(p => p.color === "white");
     const black = players.find(p => p.color === "black");
 
+    // Debug logging for player colors
+    console.log(`GameRoom: endGame called with result=${result}, reason=${reason}`);
+    console.log(`GameRoom: Players in room: ${players.map(p => `${p.id}(${p.color})`).join(', ')}`);
+
+    // Even if players are missing, still send game_ended to connected players
     if (!white || !black) {
-      console.error("GameRoom: Cannot calculate ELO - missing players");
+      console.error(`GameRoom: Missing players - white: ${!!white}, black: ${!!black}`);
+      // Send basic game_ended message without ELO data
+      const basicGameEndedMessage: GameMessage = {
+        type: "game_ended",
+        result: result as any,
+        resultReason: reason,
+        eloChanges: {
+          white: { playerId: "", oldRating: 1200, newRating: 1200, change: 0, wasProvisional: true, isProvisional: true },
+          black: { playerId: "", oldRating: 1200, newRating: 1200, change: 0, wasProvisional: true, isProvisional: true },
+        },
+        matchHistory: {
+          matchId: this.party.id,
+          whitePlayer: { id: white?.id || "", displayName: white?.displayName || "Unknown", rating: white?.rating || 1200, isProvisional: true },
+          blackPlayer: { id: black?.id || "", displayName: black?.displayName || "Unknown", rating: black?.rating || 1200, isProvisional: true },
+          gameMode: this.gameMode,
+          matchType: this.isUnrated ? "friendly" : "ranked",
+          result: result as any,
+          resultReason: reason,
+          moves: this.moveHistory,
+          startedAt: this.matchStartTime || Date.now(),
+          endedAt: Date.now(),
+          openingName: this.openingName,
+          eloChanges: {
+            white: { playerId: "", oldRating: 1200, newRating: 1200, change: 0, wasProvisional: true, isProvisional: true },
+            black: { playerId: "", oldRating: 1200, newRating: 1200, change: 0, wasProvisional: true, isProvisional: true },
+          },
+        },
+      };
+      for (const p of this.players.values()) {
+        if (p.connected && p.connection) {
+          console.log(`GameRoom: Sending basic game_ended to ${p.id} (${p.color})`);
+          p.connection.send(JSON.stringify(basicGameEndedMessage));
+        }
+      }
       return;
     }
 
-    // Calculate ELO changes
+    // Calculate ELO changes (skip for friendly/unrated matches)
     let whiteChange = 0;
     let blackChange = 0;
 
-    if (result === "white_win") {
-      const changes = this.calculateELO(
-        white.rating,
-        black.rating,
-        white.isProvisional,
-        black.isProvisional,
-        false
-      );
-      whiteChange = changes.winnerChange;
-      blackChange = changes.loserChange;
-    } else if (result === "black_win") {
-      const changes = this.calculateELO(
-        black.rating,
-        white.rating,
-        black.isProvisional,
-        white.isProvisional,
-        false
-      );
-      blackChange = changes.winnerChange;
-      whiteChange = changes.loserChange;
-    } else if (result === "draw") {
-      const changes = this.calculateELO(
-        white.rating,
-        black.rating,
-        white.isProvisional,
-        black.isProvisional,
-        true
-      );
-      whiteChange = changes.winnerChange;
-      blackChange = changes.loserChange;
+    // Only calculate ELO for ranked matches
+    if (!this.isUnrated) {
+      if (result === "white_win") {
+        const changes = this.calculateELO(
+          white.rating,
+          black.rating,
+          white.isProvisional,
+          black.isProvisional,
+          false
+        );
+        whiteChange = changes.winnerChange;
+        blackChange = changes.loserChange;
+      } else if (result === "black_win") {
+        const changes = this.calculateELO(
+          black.rating,
+          white.rating,
+          black.isProvisional,
+          white.isProvisional,
+          false
+        );
+        blackChange = changes.winnerChange;
+        whiteChange = changes.loserChange;
+      } else if (result === "draw") {
+        const changes = this.calculateELO(
+          white.rating,
+          black.rating,
+          white.isProvisional,
+          black.isProvisional,
+          true
+        );
+        whiteChange = changes.winnerChange;
+        blackChange = changes.loserChange;
+      }
+    } else {
+      console.log(`GameRoom: Friendly match - no ELO changes applied`);
     }
 
     // Create ELO rating change objects
@@ -710,11 +996,13 @@ export class GameRoom extends Server<GameRoomEnv> {
         isProvisional: black.isProvisional,
       },
       gameMode: this.gameMode,
+      matchType: this.isUnrated ? "friendly" : "ranked", // Distinguish lobby matches from ranked
       result: result as any,
       resultReason: reason,
       moves: this.moveHistory,
       startedAt: this.matchStartTime || Date.now(),
       endedAt: Date.now(),
+      openingName: this.openingName, // Include opening name for lobby matches
       eloChanges: {
         white: whiteRatingChange,
         black: blackRatingChange,
@@ -738,7 +1026,10 @@ export class GameRoom extends Server<GameRoomEnv> {
 
     for (const p of this.players.values()) {
       if (p.connected && p.connection) {
+        console.log(`GameRoom: Sending game_ended to ${p.id} (${p.color}) - connected: ${p.connected}`);
         p.connection.send(JSON.stringify(gameEndedMessage));
+      } else {
+        console.log(`GameRoom: Skipping game_ended for ${p.id} (${p.color}) - connected: ${p.connected}, hasConnection: ${!!p.connection}`);
       }
     }
 

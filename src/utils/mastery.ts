@@ -43,40 +43,66 @@ export function sanitizeUsername(raw?: string | null): string | null {
 }
 
 /**
- * Split progress key into segments
- * Example: "Sicilian_Najdorf_Main" -> ["Sicilian", "Najdorf", "Main"]
+ * Split progress key into opening name and variation name.
+ *
+ * Key format: "OpeningName_VariationName"
+ * Example: "Italian Game_Giuoco Piano" -> ["Italian Game", "Giuoco Piano"]
+ * Example: "Sicilian Defense_Najdorf Variation" -> ["Sicilian Defense", "Najdorf Variation"]
+ *
+ * Note: Both opening and variation names can contain spaces, so we split on the FIRST underscore only.
  */
 export function splitProgressKey(key: string): string[] {
   if (!key || typeof key !== 'string') return [];
-  return key
-    .split('_')
-    .map((segment) => segment.trim())
-    .filter((segment) => segment.length > 0);
+
+  // Find the first underscore - this separates opening name from variation name
+  const underscoreIndex = key.indexOf('_');
+  if (underscoreIndex > 0 && underscoreIndex < key.length - 1) {
+    const openingName = key.substring(0, underscoreIndex).trim();
+    const variationName = key.substring(underscoreIndex + 1).trim();
+    return [openingName, variationName].filter((s) => s.length > 0);
+  }
+
+  // No underscore found - return the whole key as opening name
+  const trimmed = key.trim();
+  return trimmed ? [trimmed] : [];
 }
 
 /**
- * Extract variation ID from progress key
- * Example: "Sicilian_Najdorf_Main" -> "Sicilian_Najdorf"
+ * Extract variation key from progress key.
+ * For human-readable keys, this returns the full key since it's already the variation identifier.
+ *
+ * Example: "Italian Game_Giuoco Piano" -> "Italian Game_Giuoco Piano"
  */
 export function variationIdFromKey(key: string): string {
+  // For human-readable keys, the full key IS the variation identifier
+  // This maintains uniqueness across openings
+  if (!key || typeof key !== 'string') return key;
+  return key.trim();
+}
+
+/**
+ * Extract opening name from progress key.
+ *
+ * Example: "Italian Game_Giuoco Piano" -> "Italian Game"
+ * Example: "Sicilian Defense_Najdorf Variation" -> "Sicilian Defense"
+ */
+export function openingIdFromKey(key: string): string {
   const segments = splitProgressKey(key);
-  if (segments.length >= 2) {
-    return `${segments[0]}_${segments[1]}`;
-  }
-  if (segments.length === 1) {
+  if (segments.length >= 1) {
     return segments[0];
   }
   return key;
 }
 
 /**
- * Extract opening ID from progress key
- * Example: "Sicilian_Najdorf_Main" -> "Sicilian"
+ * Extract variation name from progress key.
+ *
+ * Example: "Italian Game_Giuoco Piano" -> "Giuoco Piano"
  */
-export function openingIdFromKey(key: string): string {
+export function variationNameFromKey(key: string): string {
   const segments = splitProgressKey(key);
-  if (segments.length >= 1) {
-    return segments[0];
+  if (segments.length >= 2) {
+    return segments[1];
   }
   return key;
 }
@@ -207,31 +233,25 @@ export function analyzeProgressMap(rawMap: ProgressMap | null | undefined): Prog
 }
 
 /**
- * Compute overall progress stats with 50-50 weighting between modes
+ * Compute overall progress stats with 50-50 weighting between phases (legacy)
  *
- * The overall mastery percentage is calculated as:
- * 50% Focused Mode (mastery) + 50% Explore Mode (learn)
- *
- * This balances proficiency (mastery) with breadth of exposure (learn).
- *
- * @param masteryAnalysis - Analysis of mastery mode progress
- * @param learnAnalysis - Analysis of learn mode progress (optional)
+ * @param masteryAnalysis - Analysis of mastery phase progress
+ * @param learnAnalysis - Analysis of learn phase progress (optional)
  * @returns Aggregated progress statistics
  */
 export function computeProgressStats(
   masteryAnalysis: ProgressAnalysis,
   learnAnalysis: ProgressAnalysis | null = null
 ): ProgressStats {
-  // Calculate overall mastery as 50-50 weighted average
+  // Calculate overall mastery as 50-50 weighted average of learn/mastery phases
   let overallMasteryPercentage: number;
   if (learnAnalysis) {
-    const focusedMastery = masteryAnalysis.overallMastery * 100; // Focused/Mastery mode
-    const exploreMastery = learnAnalysis.overallMastery * 100;   // Explore/Learn mode
+    const masteryPercent = masteryAnalysis.overallMastery * 100;
+    const learnPercent = learnAnalysis.overallMastery * 100;
     overallMasteryPercentage = Number(
-      ((focusedMastery * 0.5) + (exploreMastery * 0.5)).toFixed(2)
+      ((masteryPercent * 0.5) + (learnPercent * 0.5)).toFixed(2)
     );
   } else {
-    // Fallback to legacy behavior if learnAnalysis not provided
     overallMasteryPercentage = Number(
       (masteryAnalysis.overallMastery * 100).toFixed(2)
     );
@@ -248,16 +268,178 @@ export function computeProgressStats(
   };
 }
 
+/**
+ * Mode progress data for combined calculation
+ */
+export interface ModeProgress {
+  progressMap: ProgressMap;      // Mastery phase progress
+  learnProgressMap: ProgressMap; // Learn phase progress
+}
+
+/**
+ * Compute combined progress stats from both Focused and Explore modes
+ *
+ * Formula (when totalSystemLines is provided):
+ * - Calculate total level across ALL progress maps in both modes
+ * - Divide by (totalSystemLines × 3 × 2 × 2) for full 100%
+ *   - ×3 for max level per line
+ *   - ×2 for learn + mastery phases
+ *   - ×2 for focused + explore modes
+ *
+ * Formula (legacy - when totalSystemLines is NOT provided):
+ * - Focused Mode Progress = (learn + mastery) / 2 within focused mode
+ * - Explore Mode Progress = (learn + mastery) / 2 within explore mode
+ * - Overall = (Focused Mode × 50%) + (Explore Mode × 50%)
+ *
+ * 50-50 Weighting for Openings Mastered:
+ * - totalOpeningsCount = totalSystemOpenings × 2 (one slot per mode)
+ * - Each opening mastered in focused mode = 1 towards openingsMasteredCount
+ * - Each opening mastered in explore mode = 1 towards openingsMasteredCount
+ * - Example: If user masters 2 openings in focused, 0 in explore:
+ *   openingsMasteredCount = 2, totalOpeningsCount = 40, percentage = 5%
+ *
+ * @param focusedMode - Progress data from Focused mode
+ * @param exploreMode - Progress data from Explore mode
+ * @param totalSystemLines - Total lines in the system (optional, for accurate %)
+ * @param totalSystemOpenings - Total openings in the system (optional, default 20)
+ * @returns Combined progress statistics
+ */
+export function computeCombinedProgressStats(
+  focusedMode: ModeProgress | null,
+  exploreMode: ModeProgress | null,
+  totalSystemLines?: number,
+  totalSystemOpenings: number = 20
+): ProgressStats {
+  // Analyze each mode's progress maps
+  const focusedMasteryAnalysis = analyzeProgressMap(focusedMode?.progressMap);
+  const focusedLearnAnalysis = analyzeProgressMap(focusedMode?.learnProgressMap);
+  const exploreMasteryAnalysis = analyzeProgressMap(exploreMode?.progressMap);
+  const exploreLearnAnalysis = analyzeProgressMap(exploreMode?.learnProgressMap);
+
+  let overallMasteryPercentage: number;
+
+  if (totalSystemLines && totalSystemLines > 0) {
+    // NEW: Calculate based on total system lines
+    // Total possible progress = totalSystemLines × 3 (max level) × 2 (learn+mastery) × 2 (focused+explore)
+    const maxPossibleLevel = totalSystemLines * 3 * 2 * 2;
+
+    // Sum all progress levels across all modes and phases
+    const totalProgress =
+      focusedMasteryAnalysis.totalLevel +
+      focusedLearnAnalysis.totalLevel +
+      exploreMasteryAnalysis.totalLevel +
+      exploreLearnAnalysis.totalLevel;
+
+    overallMasteryPercentage = Number(
+      ((totalProgress / maxPossibleLevel) * 100).toFixed(2)
+    );
+  } else {
+    // LEGACY: Calculate per-mode overall (50% learn + 50% mastery within each mode)
+    const focusedOverall = (
+      (focusedMasteryAnalysis.overallMastery * 0.5) +
+      (focusedLearnAnalysis.overallMastery * 0.5)
+    ) * 100;
+
+    const exploreOverall = (
+      (exploreMasteryAnalysis.overallMastery * 0.5) +
+      (exploreLearnAnalysis.overallMastery * 0.5)
+    ) * 100;
+
+    // Combined: 50% Focused + 50% Explore
+    overallMasteryPercentage = Number(
+      ((focusedOverall * 0.5) + (exploreOverall * 0.5)).toFixed(2)
+    );
+  }
+
+  // Combine mastered counts from both modes
+  const allMasteryMaps = [focusedMasteryAnalysis, exploreMasteryAnalysis];
+  const combinedMasteredVariations = allMasteryMaps.reduce(
+    (sum, a) => sum + a.variationCompletedCount, 0
+  );
+  const combinedTotalVariations = allMasteryMaps.reduce(
+    (sum, a) => sum + a.variationGroups.size, 0
+  );
+
+  // 50-50 WEIGHTING FOR OPENINGS:
+  // - Each opening mastered in focused mode counts as 1
+  // - Each opening mastered in explore mode counts as 1
+  // - Total possible = totalSystemOpenings × 2 (both modes)
+  const combinedMasteredOpenings = allMasteryMaps.reduce(
+    (sum, a) => sum + a.masteredOpeningCount, 0
+  );
+  // FIXED: Use totalSystemOpenings × 2 instead of counting openings with progress
+  // This ensures accurate percentage even when user has only partial progress
+  const combinedTotalOpenings = totalSystemOpenings * 2;
+
+  // Calculate mode-specific percentages
+  // Each mode contributes 0-100% based on its progress out of totalSystemLines
+  let focusedMasteryPercentage: number;
+  let exploreMasteryPercentage: number;
+
+  if (totalSystemLines && totalSystemLines > 0) {
+    // NEW: Calculate based on total system lines for each mode
+    // Each mode has: totalSystemLines × 3 (max level) × 2 (learn+mastery)
+    const maxPerMode = totalSystemLines * 3 * 2;
+
+    const focusedProgress = focusedMasteryAnalysis.totalLevel + focusedLearnAnalysis.totalLevel;
+    const exploreProgress = exploreMasteryAnalysis.totalLevel + exploreLearnAnalysis.totalLevel;
+
+    focusedMasteryPercentage = Number(((focusedProgress / maxPerMode) * 100).toFixed(2));
+    exploreMasteryPercentage = Number(((exploreProgress / maxPerMode) * 100).toFixed(2));
+  } else {
+    // LEGACY: Calculate per-mode percentages using old formula
+    focusedMasteryPercentage = Number((
+      (focusedMasteryAnalysis.overallMastery * 0.5) +
+      (focusedLearnAnalysis.overallMastery * 0.5)
+    ) * 100).toFixed(2) as unknown as number;
+
+    exploreMasteryPercentage = Number((
+      (exploreMasteryAnalysis.overallMastery * 0.5) +
+      (exploreLearnAnalysis.overallMastery * 0.5)
+    ) * 100).toFixed(2) as unknown as number;
+  }
+
+  // Use focused mode for strongest/weakest (primary mode)
+  const strongestOpening = focusedMasteryAnalysis.strongestOpening ||
+    exploreMasteryAnalysis.strongestOpening || 'N/A';
+  const weakestOpening = focusedMasteryAnalysis.weakestOpening ||
+    exploreMasteryAnalysis.weakestOpening || 'N/A';
+
+  return {
+    masteredVariations: combinedMasteredVariations,
+    totalVariations: combinedTotalVariations,
+    openingsMasteredCount: combinedMasteredOpenings,
+    totalOpeningsCount: combinedTotalOpenings,
+    overallMasteryPercentage,
+    focusedMasteryPercentage,
+    exploreMasteryPercentage,
+    strongestOpening,
+    weakestOpening,
+  };
+}
+
 // ============ DATE UTILITIES ============
 
 /**
- * Convert Firestore timestamp or Date to JavaScript Date
+ * Convert Firestore timestamp, ISO string, or Date to JavaScript Date
+ * Supports:
+ * - Date objects
+ * - ISO strings (e.g., "2025-12-18T10:28:39.000Z")
+ * - Legacy Firestore timestamps ({ _seconds, _nanoseconds })
  */
 export function toDateTime(value: any): Date | null {
   if (!value) return null;
   if (value instanceof Date) return value;
+  // Handle ISO string format
+  if (typeof value === 'string') {
+    const date = new Date(value);
+    if (!Number.isNaN(date.getTime())) {
+      return date;
+    }
+    return null;
+  }
+  // Handle legacy Firestore timestamp format
   if (typeof value === 'object' && '_seconds' in value) {
-    // Firestore timestamp
     return new Date(value._seconds * 1000);
   }
   const date = new Date(value);
@@ -274,6 +456,48 @@ export function startOfLocalDay(date: Date): Date {
   const local = new Date(date.getTime());
   local.setHours(0, 0, 0, 0);
   return local;
+}
+
+/**
+ * Format date as YYYY-MM-DD for activity log keys
+ * This matches the format used by Flutter's StreakService
+ */
+export function formatDateKey(date: Date): string {
+  const year = date.getFullYear().toString();
+  const month = (date.getMonth() + 1).toString().padStart(2, '0');
+  const day = date.getDate().toString().padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+/**
+ * Format a date to human-readable string
+ * Example: "December 18, 2025 at 10:28:39 AM UTC+5:30"
+ *
+ * @param date - Date object or ISO string
+ * @param timezone - Optional IANA timezone (default: 'Asia/Kolkata' for UTC+5:30)
+ * @returns Human-readable date string
+ */
+export function formatTimestamp(date: Date | string, timezone: string = 'Asia/Kolkata'): string {
+  const d = typeof date === 'string' ? new Date(date) : date;
+
+  // Format with Intl.DateTimeFormat for consistent output
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: timezone,
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: true,
+    timeZoneName: 'shortOffset',
+  });
+
+  const parts = formatter.formatToParts(d);
+  const getPart = (type: string) => parts.find(p => p.type === type)?.value || '';
+
+  // Build the formatted string: "December 18, 2025 at 10:28:39 AM UTC+5:30"
+  return `${getPart('month')} ${getPart('day')}, ${getPart('year')} at ${getPart('hour')}:${getPart('minute')}:${getPart('second')} ${getPart('dayPeriod')} ${getPart('timeZoneName')}`;
 }
 
 /**

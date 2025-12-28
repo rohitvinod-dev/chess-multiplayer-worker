@@ -11,7 +11,7 @@
 import type { FirestoreClient } from '../../firestore';
 import type { AuthenticatedUser, EnsureUserProfileRequest } from '../../types';
 import { ApiError, ErrorCodes } from '../../types';
-import { sanitizeUsername } from '../../utils/mastery';
+import { sanitizeUsername, formatTimestamp } from '../../utils/mastery';
 
 export async function handleEnsureUserProfile(
   request: Request,
@@ -72,13 +72,13 @@ export async function handleEnsureUserProfile(
 
     // Prepare user profile updates
     const payload: any = {
-      updatedAt: { _seconds: Math.floor(now.getTime() / 1000), _nanoseconds: 0 },
+      updatedAt: formatTimestamp(now),
     };
 
     // ONLY set these fields for genuinely new users
     // NEVER overwrite createdAt for existing users!
     if (isNewUser) {
-      payload.createdAt = { _seconds: Math.floor(now.getTime() / 1000), _nanoseconds: 0 };
+      payload.createdAt = formatTimestamp(now);
       payload.isPro = false;
       payload.totalPoints = 0;
       payload.learnPoints = 0;
@@ -122,7 +122,7 @@ export async function handleEnsureUserProfile(
       overallMasteryPercentage: existingData.overallMasteryPercentage || 0,
       currentStreak: existingData.currentStreak || 0,
       totalSessions: existingData.totalSessions || 0,
-      updatedAt: { _seconds: Math.floor(now.getTime() / 1000), _nanoseconds: 0 },
+      updatedAt: formatTimestamp(now),
     };
 
     await firestore.setDocument(`leaderboard/${user.uid}`, leaderboardPayload, { merge: true });
