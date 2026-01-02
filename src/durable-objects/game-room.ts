@@ -1296,16 +1296,19 @@ export class GameRoom extends Server<GameRoomEnv> {
               }, { merge: true });
               console.error(`✅ Updated ratings for ${playerId}: ${newRating} ELO (${newGamesPlayed} games)`);
 
-              // Update leaderboard entry
+              // Update leaderboard entry (include username for display)
               await firestore.setDocument(leaderboardPath, {
+                username: playerName || currentLeaderboard?.username || 'Unknown',
+                displayName: playerName || currentLeaderboard?.displayName || 'Unknown',
                 eloRating: newRating,
                 totalGames: newGamesPlayed,
+                provisionalGames: Math.min(newGamesPlayed, 30),
                 wins: newWins,
                 losses: newLosses,
                 draws: newDraws,
                 updatedAt: new Date(),
               }, { merge: true });
-              console.error(`✅ Updated leaderboard for ${playerId}`);
+              console.error(`✅ Updated leaderboard for ${playerId} (${playerName})`);
 
             } catch (ratingError) {
               console.error(`❌ Failed to update rating for ${playerId}:`, ratingError);

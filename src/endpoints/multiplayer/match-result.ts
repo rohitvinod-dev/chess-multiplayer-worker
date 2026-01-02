@@ -83,8 +83,9 @@ export async function handleMatchResult(
     const eloUpdate = calculateELO(matchResult);
 
     // Get user info for leaderboard sync
-    const whiteUser = await firestore.getDocument(`users/${body.whitePlayerId}`);
-    const blackUser = await firestore.getDocument(`users/${body.blackPlayerId}`);
+    // Username is stored in users/{uid}/public/data, not users/{uid}
+    const whiteUser = await firestore.getDocument(`users/${body.whitePlayerId}/public/data`);
+    const blackUser = await firestore.getDocument(`users/${body.blackPlayerId}/public/data`);
 
     // Prepare batch write operations
     const now = Date.now();
