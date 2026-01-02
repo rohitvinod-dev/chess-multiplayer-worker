@@ -73,10 +73,11 @@ export async function spectateLobbyHandler(
     }
 
     // Generate WebSocket URL for spectator
-    const protocol = new URL(request.url).protocol === 'https:' ? 'wss:' : 'ws:';
-    const host = request.headers.get('host') || 'localhost';
+    // Use production host for WebSocket connections (not the request host which may be internal)
+    const host = 'checkmatex-worker-production.rohitvinod-dev.workers.dev';
 
-    const webSocketUrl = `${protocol}//${host}/game/${lobby.gameRoomId}?` +
+    // Use /parties/game-room/ path to match partyserver routing
+    const webSocketUrl = `wss://${host}/parties/game-room/${lobby.gameRoomId}?` +
       `playerId=${userId}&` +
       `displayName=${encodeURIComponent(body.spectatorDisplayName)}&` +
       `mode=spectator`;
@@ -85,9 +86,12 @@ export async function spectateLobbyHandler(
 
     return new Response(JSON.stringify({
       lobbyId: body.lobbyId,
+      roomId: lobby.gameRoomId, // Game room ID for spectator connection
       webSocketUrl,
       whitePlayer: lobby.whiteDisplayName,
       blackPlayer: lobby.blackDisplayName,
+      whiteRating: lobby.whiteRating,
+      blackRating: lobby.blackRating,
     }), {
       status: 200,
       headers: { 'Content-Type': 'application/json' },

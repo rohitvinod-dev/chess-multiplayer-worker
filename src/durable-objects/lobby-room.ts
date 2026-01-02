@@ -645,6 +645,7 @@ export class LobbyRoom extends Server<LobbyRoomEnv> {
       gameMode: this.settings.gameMode,
       isLobbyMode: true,
       isUnrated: false,
+      lobbyId: this.lobbyId, // Pass lobbyId so GameRoom can clean up lobby on game end
       openingName: this.settings.openingName,
       startingFen: this.settings.openingFen,
       players: {

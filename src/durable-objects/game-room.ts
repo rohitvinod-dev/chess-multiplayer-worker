@@ -4,6 +4,8 @@ import {
   type WSMessage,
 } from "partyserver";
 
+import { FirestoreClient } from "../firestore";
+
 import type {
   GameMode,
   PlayerColor,
@@ -46,7 +48,10 @@ const RECONNECT_TIMEOUT_MS = 60000; // 60 seconds (1 minute) to reconnect before
 interface GameRoomEnv {
   GameRoom: DurableObjectNamespace;
   MATCHMAKING_QUEUE: DurableObjectNamespace;
+  LOBBY_LIST: DurableObjectNamespace;
   ASSETS: Fetcher;
+  FIREBASE_PROJECT_ID: string;
+  FIREBASE_SERVICE_ACCOUNT: string;
 }
 
 export class GameRoom extends Server<GameRoomEnv> {
@@ -67,6 +72,7 @@ export class GameRoom extends Server<GameRoomEnv> {
   // Lobby mode
   isLobbyMode: boolean = false;
   isUnrated: boolean = false;
+  lobbyId?: string; // Set when created from a lobby, used to cleanup lobby on game end
   openingName?: string;
   startingFen?: string;
 
@@ -175,6 +181,7 @@ export class GameRoom extends Server<GameRoomEnv> {
         gameMode: GameMode;
         isLobbyMode: boolean;
         isUnrated: boolean;
+        lobbyId?: string;
         openingName?: string;
         startingFen?: string;
         players: {
@@ -190,6 +197,7 @@ export class GameRoom extends Server<GameRoomEnv> {
       this.isLobbyMode = data.isLobbyMode;
       // Lobby matches are always unrated (friendly matches)
       this.isUnrated = true;
+      this.lobbyId = data.lobbyId; // Store lobbyId for cleanup on game end
       this.openingName = data.openingName;
 
       if (data.startingFen) {
@@ -315,6 +323,9 @@ export class GameRoom extends Server<GameRoomEnv> {
 
       // Send current game state to spectator
       this.sendGameStateToSpectator(playerId);
+
+      // Broadcast updated spectator count to all
+      this.broadcastSpectatorCount();
       return;
     }
 
@@ -378,8 +389,13 @@ export class GameRoom extends Server<GameRoomEnv> {
   }
 
   onMessage(connection: Connection, message: WSMessage) {
+    // VERSION MARKER: 2025-12-31 v3 - CRITICAL DEBUG LOGGING
+    console.error(`🚨🚨🚨 GameRoom.onMessage ENTRY - gameStatus=${this.gameStatus}, partyId=${this.party?.id}`);
+    console.log(`🚨 GameRoom.onMessage raw message: ${String(message).substring(0, 200)}`);
+
     try {
       const data = JSON.parse(message as string) as any;
+      console.error(`🚨 GameRoom.onMessage parsed type=${data.type}, gameStatus=${this.gameStatus}`);
 
       // Find which player sent this message first
       let sendingPlayer: PlayerSession | undefined;
@@ -423,9 +439,11 @@ export class GameRoom extends Server<GameRoomEnv> {
 
       switch (gameMessage.type) {
         case "move":
+          console.log(`🚨 GameRoom: Handling move from ${sendingPlayer.id}`);
           this.handleMove(sendingPlayer, data);
           break;
         case "resign":
+          console.error(`🚨 GameRoom: Handling RESIGN from ${sendingPlayer.id}`);
           this.handleResign(sendingPlayer);
           break;
         case "chat":
@@ -436,12 +454,16 @@ export class GameRoom extends Server<GameRoomEnv> {
           break;
         // Task 6: Handle player ready message
         case "ready":
+          console.log(`🚨 GameRoom: Handling ready from ${sendingPlayer.id}`);
           this.handlePlayerReady(sendingPlayer);
           break;
         // Handle client-reported game end (checkmate, stalemate, draw)
         case "game_end":
+          console.error(`🚨 GameRoom: Handling GAME_END from ${sendingPlayer.id} - data=${JSON.stringify(data)}`);
           this.handleGameEndRequest(sendingPlayer, data);
           break;
+        default:
+          console.error(`🚨 GameRoom: UNHANDLED message type: ${gameMessage.type}`);
       }
     } catch (error) {
       console.error("Error handling message:", error);
@@ -449,11 +471,16 @@ export class GameRoom extends Server<GameRoomEnv> {
   }
 
   onClose(connection: Connection) {
+    // VERSION MARKER: 2025-12-31 v3 - CRITICAL DEBUG LOGGING
+    console.error(`🚨🚨🚨 GameRoom.onClose ENTRY - gameStatus=${this.gameStatus}, partyId=${this.party?.id}`);
+
     // Check if this is a spectator disconnection
     for (const [spectatorId, spectator] of this.spectators) {
       if (spectator.connection === connection) {
         this.spectators.delete(spectatorId);
         console.log(`GameRoom: Spectator ${spectatorId} disconnected. Total spectators: ${this.spectators.size}`);
+        // Broadcast updated spectator count
+        this.broadcastSpectatorCount();
         return; // Spectators don't affect game state
       }
     }
@@ -464,23 +491,35 @@ export class GameRoom extends Server<GameRoomEnv> {
         player.connected = false;
         player.connection = undefined;
 
-        console.log(`GameRoom: Player ${player.id} disconnected`);
+        console.log(`GameRoom: Player ${player.id} disconnected, gameStatus: ${this.gameStatus}`);
 
         // Task 5: Clean up ping tracking
         this.lastPingTimes.delete(player.id);
 
+        // If game already ended (resignation, checkmate, etc.), don't send disconnect notification
+        // This prevents showing "opponent left" when they actually resigned
+        if (this.gameStatus === "finished") {
+          console.log(`GameRoom: Game already finished, skipping disconnect notification`);
+          break;
+        }
+
         // Task 5: Notify opponent of disconnection with reconnect timeout
         this.notifyOpponentOfDisconnection(player.id);
 
-        // Task 5: If game is active and player disconnects for 10 seconds, abandon
+        // Task 5: If game is active and player disconnects, start abandon timer
         if (this.gameStatus === "playing" || this.gameStatus === "ready") {
+          console.error(`🚨 GameRoom: Starting abandonment timer for player ${player.id}`);
           this.abandonmentTimeoutId = setTimeout(() => {
-            if (!player.connected) {
-              console.log(`GameRoom: Player ${player.id} abandoned game`);
-              this.endGame(
-                player.color === "white" ? "black_win" : "white_win",
-                "opponent_abandoned"
-              );
+            // Double check game hasn't ended and player hasn't reconnected
+            console.error(`🚪🚪🚪 ABANDONMENT TIMER FIRED for player ${player.id}`);
+            console.error(`🚪🚪🚪 connected=${player.connected}, gameStatus=${this.gameStatus}`);
+            if (!player.connected && this.gameStatus !== "finished") {
+              const result = player.color === "white" ? "black_win" : "white_win";
+              console.error(`🚪🚪🚪 ABOUT TO CALL endGame("${result}", "opponent_abandoned") FROM ABANDON TIMER`);
+              this.endGame(result, "opponent_abandoned");
+              console.error(`🚪🚪🚪 endGame RETURNED from abandon timer`);
+            } else {
+              console.error(`🚪🚪🚪 Skipping endGame: connected=${player.connected}, gameStatus=${this.gameStatus}`);
             }
           }, RECONNECT_TIMEOUT_MS) as unknown as number;
         }
@@ -659,11 +698,40 @@ export class GameRoom extends Server<GameRoomEnv> {
   }
 
   private handleResign(player: PlayerSession) {
-    if (this.gameStatus !== "playing") return;
+    if (this.gameStatus !== "playing") {
+      console.log(`GameRoom: Ignoring resign - game status is ${this.gameStatus}`);
+      return;
+    }
+
+    console.log(`🔥 GameRoom: handleResign called by ${player.id} (${player.color})`);
 
     const result =
       player.color === "white" ? "black_win" : "white_win";
+
+    // Immediately notify opponent of resignation (before game_ended)
+    // This ensures the opponent's frontend knows it's a resignation, not abandonment
+    const resignMessage: GameMessage = {
+      type: "resign",
+      resignedBy: player.color,
+      outcome: player.color === "white" ? "black" : "white",
+    };
+
+    // Notify opponent with error handling
+    try {
+      for (const p of this.players.values()) {
+        if (p && p.id && p.id !== player.id && p.connected && p.connection) {
+          console.log(`GameRoom: Notifying ${p.id} of resignation by ${player.color}`);
+          p.connection.send(JSON.stringify(resignMessage));
+        }
+      }
+    } catch (error) {
+      console.error(`GameRoom: Error notifying opponent of resignation:`, error);
+      // Continue to endGame even if notification fails
+    }
+
+    console.error(`🏳️🏳️🏳️ handleResign ABOUT TO CALL endGame("${result}", "resignation")`);
     this.endGame(result, "resignation");
+    console.error(`🏳️🏳️🏳️ handleResign - endGame RETURNED`);
   }
 
   /**
@@ -726,10 +794,10 @@ export class GameRoom extends Server<GameRoomEnv> {
       this.gameState.fen = fen;
     }
 
-    console.log(`GameRoom: Game ended by client request - result: ${result}, reason: ${reason}`);
-    console.log(`GameRoom: >>> Calling endGame now...`);
+    console.error(`🎯🎯🎯 handleGameEndRequest: result=${result}, reason=${reason}`);
+    console.error(`🎯🎯🎯 ABOUT TO CALL endGame("${result}", "${reason}") FROM CLIENT REQUEST`);
     this.endGame(result, reason);
-    console.log(`GameRoom: >>> endGame completed`);
+    console.error(`🎯🎯🎯 handleGameEndRequest - endGame RETURNED`);
   }
 
   private handleChat(player: PlayerSession, message: string) {
@@ -753,7 +821,13 @@ export class GameRoom extends Server<GameRoomEnv> {
 
   private startClockInterval() {
     const intervalMs = 100; // Update every 100ms
+    let tickCount = 0;
     this.clockIntervalId = setInterval(() => {
+      tickCount++;
+      // Log every 50 ticks (5 seconds) to verify interval is running
+      if (tickCount % 50 === 0) {
+        console.error(`⏱️ CLOCK TICK #${tickCount}: gameStatus=${this.gameStatus}, white=${this.clock.white.remaining}ms, black=${this.clock.black.remaining}ms`);
+      }
       if (this.gameStatus !== "playing") return;
 
       const now = Date.now();
@@ -762,15 +836,19 @@ export class GameRoom extends Server<GameRoomEnv> {
       if (this.clock.currentTurn === "white") {
         this.clock.white.remaining -= elapsed;
         if (this.clock.white.remaining <= 0) {
-          console.log(`GameRoom: White time expired! Remaining: ${this.clock.white.remaining}ms`);
+          console.error(`⏱️⏱️⏱️ WHITE TIMEOUT DETECTED! remaining=${this.clock.white.remaining}ms, tickCount=${tickCount}`);
+          console.error(`⏱️⏱️⏱️ ABOUT TO CALL endGame("black_win", "timeout") FROM CLOCK INTERVAL`);
           this.endGame("black_win", "timeout");
+          console.error(`⏱️⏱️⏱️ endGame RETURNED from clock interval`);
           return; // Stop processing after game ends
         }
       } else {
         this.clock.black.remaining -= elapsed;
         if (this.clock.black.remaining <= 0) {
-          console.log(`GameRoom: Black time expired! Remaining: ${this.clock.black.remaining}ms`);
+          console.error(`⏱️⏱️⏱️ BLACK TIMEOUT DETECTED! remaining=${this.clock.black.remaining}ms, tickCount=${tickCount}`);
+          console.error(`⏱️⏱️⏱️ ABOUT TO CALL endGame("white_win", "timeout") FROM CLOCK INTERVAL`);
           this.endGame("white_win", "timeout");
+          console.error(`⏱️⏱️⏱️ endGame RETURNED from clock interval`);
           return; // Stop processing after game ends
         }
       }
@@ -856,65 +934,116 @@ export class GameRoom extends Server<GameRoomEnv> {
   }
 
   private endGame(result: string, reason: string) {
-    if (this.gameStatus === "finished") return;
+    // CRITICAL: Log immediately before any operations that could fail
+    // VERSION MARKER: 2025-12-31 v4 - UNIQUE ID FOR EACH CALL
+    const callId = Math.random().toString(36).substring(7);
+    console.error(`╔════════════════════════════════════════════════════════════╗`);
+    console.error(`║ 🔥🔥🔥 GameRoom.endGame CALLED [${callId}]                 ║`);
+    console.error(`║ result=${result}, reason=${reason}                          ║`);
+    console.error(`║ partyId=${this.party?.id}, gameStatus=${this.gameStatus}    ║`);
+    console.error(`║ timestamp=${Date.now()}                                      ║`);
+    console.error(`╚════════════════════════════════════════════════════════════╝`);
+    console.error(`GameRoom: >>> endGame ENTRY [${callId}] - result=${result}, reason=${reason}, current gameStatus=${this.gameStatus}`);
 
+    if (this.gameStatus === "finished") {
+      console.error(`GameRoom: endGame skipped - already finished`);
+      return;
+    }
+
+    // Set status immediately
     this.gameStatus = "finished";
-    this.gameState.result = result as any;
-    this.gameState.resultReason = reason;
+    console.error(`GameRoom: Status set to finished - MATCH HISTORY WILL BE SAVED`);
 
-    // Stop timers
-    if (this.clockIntervalId) clearInterval(this.clockIntervalId);
-    if (this.abandonmentTimeoutId)
-      clearTimeout(this.abandonmentTimeoutId);
-    if (this.moveTimeoutId) clearTimeout(this.moveTimeoutId);
+    try {
+      this.gameState.result = result as any;
+      this.gameState.resultReason = reason;
 
-    // Save final state
-    this.saveGameState();
+      // Stop timers
+      if (this.clockIntervalId) clearInterval(this.clockIntervalId);
+      if (this.abandonmentTimeoutId) clearTimeout(this.abandonmentTimeoutId);
+      if (this.moveTimeoutId) clearTimeout(this.moveTimeoutId);
+      console.log(`GameRoom: Timers cleared`);
+    } catch (e) {
+      console.error(`GameRoom: Error clearing timers:`, e);
+    }
 
-    // Get players
-    const players = Array.from(this.players.values());
-    const white = players.find(p => p.color === "white");
-    const black = players.find(p => p.color === "black");
+    // Save final state (non-blocking, catch errors)
+    try {
+      this.saveGameState();
+      console.log(`GameRoom: State saved`);
+    } catch (e) {
+      console.error(`GameRoom: Error saving state:`, e);
+      // Continue - state save failure shouldn't prevent game_ended
+    }
 
-    // Debug logging for player colors
-    console.log(`GameRoom: endGame called with result=${result}, reason=${reason}`);
-    console.log(`GameRoom: Players in room: ${players.map(p => `${p.id}(${p.color})`).join(', ')}`);
+    // Get players safely
+    let players: PlayerSession[] = [];
+    let white: PlayerSession | undefined;
+    let black: PlayerSession | undefined;
+    
+    try {
+      players = this.players ? Array.from(this.players.values()) : [];
+      white = players.find(p => p.color === "white");
+      black = players.find(p => p.color === "black");
+      console.log(`GameRoom: endGame called with result=${result}, reason=${reason}`);
+      console.log(`GameRoom: Players in room: ${players.map(p => `${p.id}(${p.color})`).join(', ')}`);
+    } catch (e) {
+      console.error(`GameRoom: Error getting players:`, e);
+      // players array is empty, will fall through to basic message handling
+    }
+
+    // Get room ID safely (this.party might be undefined in some edge cases)
+    const roomId = this.party?.id || `room-${Date.now()}`;
+    console.log(`GameRoom: Room ID for match history: ${roomId}`);
 
     // Even if players are missing, still send game_ended to connected players
     if (!white || !black) {
       console.error(`GameRoom: Missing players - white: ${!!white}, black: ${!!black}`);
       // Send basic game_ended message without ELO data
-      const basicGameEndedMessage: GameMessage = {
-        type: "game_ended",
-        result: result as any,
-        resultReason: reason,
-        eloChanges: {
-          white: { playerId: "", oldRating: 1200, newRating: 1200, change: 0, wasProvisional: true, isProvisional: true },
-          black: { playerId: "", oldRating: 1200, newRating: 1200, change: 0, wasProvisional: true, isProvisional: true },
-        },
-        matchHistory: {
-          matchId: this.party.id,
-          whitePlayer: { id: white?.id || "", displayName: white?.displayName || "Unknown", rating: white?.rating || 1200, isProvisional: true },
-          blackPlayer: { id: black?.id || "", displayName: black?.displayName || "Unknown", rating: black?.rating || 1200, isProvisional: true },
-          gameMode: this.gameMode,
-          matchType: this.isUnrated ? "friendly" : "ranked",
+      try {
+        const basicGameEndedMessage: GameMessage = {
+          type: "game_ended",
           result: result as any,
           resultReason: reason,
-          moves: this.moveHistory,
-          startedAt: this.matchStartTime || Date.now(),
-          endedAt: Date.now(),
-          openingName: this.openingName,
           eloChanges: {
             white: { playerId: "", oldRating: 1200, newRating: 1200, change: 0, wasProvisional: true, isProvisional: true },
             black: { playerId: "", oldRating: 1200, newRating: 1200, change: 0, wasProvisional: true, isProvisional: true },
           },
-        },
-      };
-      for (const p of this.players.values()) {
-        if (p.connected && p.connection) {
-          console.log(`GameRoom: Sending basic game_ended to ${p.id} (${p.color})`);
-          p.connection.send(JSON.stringify(basicGameEndedMessage));
+          matchHistory: {
+            matchId: roomId,
+            whitePlayer: { id: white?.id || "", displayName: white?.displayName || "Unknown", rating: white?.rating || 1200, isProvisional: true },
+            blackPlayer: { id: black?.id || "", displayName: black?.displayName || "Unknown", rating: black?.rating || 1200, isProvisional: true },
+            gameMode: this.gameMode,
+            matchType: this.isUnrated ? "friendly" : "ranked",
+            result: result as any,
+            resultReason: reason,
+            moves: this.moveHistory || [],
+            finalFen: this.gameState?.fen || "",
+            pgn: "",
+            startedAt: this.matchStartTime || Date.now(),
+            endedAt: Date.now(),
+            openingName: this.openingName,
+            eloChanges: {
+              white: { playerId: "", oldRating: 1200, newRating: 1200, change: 0, wasProvisional: true, isProvisional: true },
+              black: { playerId: "", oldRating: 1200, newRating: 1200, change: 0, wasProvisional: true, isProvisional: true },
+            },
+          },
+        };
+        
+        if (this.players) {
+          for (const p of this.players.values()) {
+            try {
+              if (p.connected && p.connection) {
+                console.log(`GameRoom: Sending basic game_ended to ${p.id} (${p.color})`);
+                p.connection.send(JSON.stringify(basicGameEndedMessage));
+              }
+            } catch (sendError) {
+              console.error(`GameRoom: Error sending basic game_ended to ${p.id}:`, sendError);
+            }
+          }
         }
+      } catch (e) {
+        console.error(`GameRoom: Error creating/sending basic game_ended message:`, e);
       }
       return;
     }
@@ -960,6 +1089,15 @@ export class GameRoom extends Server<GameRoomEnv> {
       console.log(`GameRoom: Friendly match - no ELO changes applied`);
     }
 
+    // Debug: Verify players and party still exist
+    console.log(`GameRoom: Creating ELO objects - white: ${white?.id}, black: ${black?.id}, party: ${this.party?.id}`);
+
+    // Defensive check - players might have been removed during async operations
+    if (!white || !black) {
+      console.error(`GameRoom: Players became undefined after check! white: ${!!white}, black: ${!!black}`);
+      return;
+    }
+
     // Create ELO rating change objects
     const whiteRatingChange: ELORatingChange = {
       playerId: white.id,
@@ -980,9 +1118,15 @@ export class GameRoom extends Server<GameRoomEnv> {
       isProvisional: black.isProvisional && this.moveHistory.length < 20,
     };
 
+    // Generate PGN from move history
+    const pgn = this.generatePgn();
+
+    // roomId already defined above
+    console.log(`GameRoom: Creating match history with roomId: ${roomId}`);
+
     // Create match history data
     const matchHistory: MatchHistoryData = {
-      matchId: this.party.id,
+      matchId: roomId,
       whitePlayer: {
         id: white.id,
         displayName: white.displayName,
@@ -1000,6 +1144,8 @@ export class GameRoom extends Server<GameRoomEnv> {
       result: result as any,
       resultReason: reason,
       moves: this.moveHistory,
+      finalFen: this.gameState.fen, // Final position
+      pgn: pgn, // PGN notation
       startedAt: this.matchStartTime || Date.now(),
       endedAt: Date.now(),
       openingName: this.openingName, // Include opening name for lobby matches
@@ -1011,6 +1157,202 @@ export class GameRoom extends Server<GameRoomEnv> {
 
     console.log(`GameRoom: Match ended - White: ${whiteChange >= 0 ? '+' : ''}${whiteChange}, Black: ${blackChange >= 0 ? '+' : ''}${blackChange}`);
     console.log(`GameRoom: ${this.moveHistory.length} moves recorded`);
+
+    // ==================== SERVER-SIDE MATCH HISTORY SAVE ====================
+    // Save match history to Firestore for BOTH players, regardless of connection state.
+    // This guarantees persistence even if players disconnect before receiving game_ended.
+    const saveMatchHistoryToFirestore = async () => {
+      try {
+        console.error(`📝 Starting server-side match history save for match ${roomId}`);
+
+        const firestore = new FirestoreClient({
+          projectId: this.env.FIREBASE_PROJECT_ID,
+          serviceAccount: this.env.FIREBASE_SERVICE_ACCOUNT,
+        });
+
+        // Build efficient match data (shared between both player documents)
+        const sharedMatchData = {
+          matchId: roomId,
+          // Players info
+          whitePlayer: {
+            id: white.id,
+            displayName: white.displayName,
+            rating: white.rating,
+            isProvisional: white.isProvisional,
+          },
+          blackPlayer: {
+            id: black.id,
+            displayName: black.displayName,
+            rating: black.rating,
+            isProvisional: black.isProvisional,
+          },
+          // Result
+          result: result, // 'white_win', 'black_win', or 'draw'
+          reason: reason, // 'resignation', 'timeout', 'checkmate', 'stalemate', 'opponent_abandoned'
+          // Rating changes
+          whiteRatingChange: whiteRatingChange.change,
+          blackRatingChange: blackRatingChange.change,
+          // Game info
+          gameMode: this.gameMode || 'blitz',
+          matchType: this.isUnrated ? 'friendly' : 'ranked',
+          startingFen: this.startingFen || 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1',
+          finalFen: this.gameState.fen,
+          openingName: this.openingName || null,
+          // Moves with timestamps for replay
+          moves: this.moveHistory.map(m => ({
+            uci: m.uci,
+            san: m.san,
+            timestamp: m.timestamp,
+            madeBy: m.madeBy,
+          })),
+          // Timestamps
+          playedAt: new Date().toISOString(),
+          gameStartedAt: this.matchStartTime || Date.now(),
+          gameEndedAt: Date.now(),
+        };
+
+        // Save for white player
+        if (white.id) {
+          await firestore.setDocument(`users/${white.id}/matchHistory/${roomId}`, {
+            ...sharedMatchData,
+            playerColor: 'white',
+            opponentId: black.id,
+            opponentUsername: black.displayName,
+            opponentElo: black.rating,
+            playerResult: result === 'white_win' ? 'win' : result === 'black_win' ? 'loss' : 'draw',
+            eloChange: whiteRatingChange.change,
+            eloAfter: whiteRatingChange.newRating,
+          });
+          console.error(`✅ Match history saved for WHITE player ${white.id} (${white.displayName})`);
+        }
+
+        // Save for black player
+        if (black.id) {
+          await firestore.setDocument(`users/${black.id}/matchHistory/${roomId}`, {
+            ...sharedMatchData,
+            playerColor: 'black',
+            opponentId: white.id,
+            opponentUsername: white.displayName,
+            opponentElo: white.rating,
+            playerResult: result === 'black_win' ? 'win' : result === 'white_win' ? 'loss' : 'draw',
+            eloChange: blackRatingChange.change,
+            eloAfter: blackRatingChange.newRating,
+          });
+          console.error(`✅ Match history saved for BLACK player ${black.id} (${black.displayName})`);
+        }
+
+        console.error(`📝 Server-side match history save COMPLETE for match ${roomId}`);
+
+        // ==================== UPDATE ELO RATINGS (RANKED MATCHES ONLY) ====================
+        if (!this.isUnrated) {
+          console.error(`📊 Updating ELO ratings for ranked match ${roomId}`);
+
+          // Helper to update a player's rating
+          const updatePlayerRating = async (
+            playerId: string,
+            playerName: string,
+            newRating: number,
+            isProvisional: boolean,
+            isWin: boolean,
+            isLoss: boolean,
+            isDraw: boolean
+          ) => {
+            if (!playerId) return;
+
+            const ratingsPath = `users/${playerId}/profile/ratings`;
+            const leaderboardPath = `leaderboards/elo/players/${playerId}`;
+
+            try {
+              // First, get current stats
+              const currentRatings = await firestore.getDocument(ratingsPath);
+              const currentLeaderboard = await firestore.getDocument(leaderboardPath);
+
+              const currentGamesPlayed = currentRatings?.gamesPlayed || currentLeaderboard?.totalGames || 0;
+              const currentWins = currentRatings?.wins || currentLeaderboard?.wins || 0;
+              const currentLosses = currentRatings?.losses || currentLeaderboard?.losses || 0;
+              const currentDraws = currentRatings?.draws || currentLeaderboard?.draws || 0;
+
+              const newGamesPlayed = currentGamesPlayed + 1;
+              const newWins = isWin ? currentWins + 1 : currentWins;
+              const newLosses = isLoss ? currentLosses + 1 : currentLosses;
+              const newDraws = isDraw ? currentDraws + 1 : currentDraws;
+
+              // Provisional status ends after 20 games
+              const newIsProvisional = isProvisional && newGamesPlayed < 20;
+
+              // Update user's ratings document
+              // Field names must match Flutter's PlayerRating model
+              await firestore.setDocument(ratingsPath, {
+                eloRating: newRating,
+                totalGamesPlayed: newGamesPlayed,
+                provisionalGames: Math.min(newGamesPlayed, 30), // Cap at 30 for provisional period
+                wins: newWins,
+                losses: newLosses,
+                draws: newDraws,
+                // Keep isProvisional for backwards compatibility but Flutter uses provisionalGames
+                isProvisional: newIsProvisional,
+                // Use Date object so FirestoreClient encodes it as a Firestore Timestamp
+                updatedAt: new Date(),
+              }, { merge: true });
+              console.error(`✅ Updated ratings for ${playerId}: ${newRating} ELO (${newGamesPlayed} games)`);
+
+              // Update leaderboard entry
+              await firestore.setDocument(leaderboardPath, {
+                eloRating: newRating,
+                totalGames: newGamesPlayed,
+                wins: newWins,
+                losses: newLosses,
+                draws: newDraws,
+                updatedAt: new Date(),
+              }, { merge: true });
+              console.error(`✅ Updated leaderboard for ${playerId}`);
+
+            } catch (ratingError) {
+              console.error(`❌ Failed to update rating for ${playerId}:`, ratingError);
+            }
+          };
+
+          // Determine win/loss/draw for each player
+          const whiteWon = result === 'white_win';
+          const blackWon = result === 'black_win';
+          const isDraw = result === 'draw';
+
+          // Update both players' ratings
+          await updatePlayerRating(
+            white.id,
+            white.displayName,
+            whiteRatingChange.newRating,
+            whiteRatingChange.isProvisional,
+            whiteWon,
+            blackWon,
+            isDraw
+          );
+
+          await updatePlayerRating(
+            black.id,
+            black.displayName,
+            blackRatingChange.newRating,
+            blackRatingChange.isProvisional,
+            blackWon,
+            whiteWon,
+            isDraw
+          );
+
+          console.error(`📊 ELO rating updates COMPLETE for match ${roomId}`);
+        } else {
+          console.error(`📊 Skipping ELO updates for friendly/unrated match ${roomId}`);
+        }
+        // ==================== END ELO RATING UPDATES ====================
+
+      } catch (error) {
+        console.error(`❌ Failed to save match history to Firestore:`, error);
+      }
+    };
+
+    // Fire and forget - don't block endGame on Firestore write
+    // Using ctx.waitUntil would be ideal but we're in a method, so we just fire-and-forget
+    saveMatchHistoryToFirestore();
+    // ==================== END SERVER-SIDE MATCH HISTORY SAVE ====================
 
     // Send game_ended message with ELO changes and match history to both players
     const gameEndedMessage: GameMessage = {
@@ -1024,12 +1366,19 @@ export class GameRoom extends Server<GameRoomEnv> {
       matchHistory,
     };
 
+    // Send game_ended to all players with error handling
+    console.log(`GameRoom: >>> About to send game_ended to players`);
     for (const p of this.players.values()) {
-      if (p.connected && p.connection) {
-        console.log(`GameRoom: Sending game_ended to ${p.id} (${p.color}) - connected: ${p.connected}`);
-        p.connection.send(JSON.stringify(gameEndedMessage));
-      } else {
-        console.log(`GameRoom: Skipping game_ended for ${p.id} (${p.color}) - connected: ${p.connected}, hasConnection: ${!!p.connection}`);
+      try {
+        if (p.connected && p.connection) {
+          console.log(`GameRoom: Sending game_ended to ${p.id} (${p.color}) - connected: ${p.connected}`);
+          p.connection.send(JSON.stringify(gameEndedMessage));
+          console.log(`GameRoom: >>> Successfully sent game_ended to ${p.id}`);
+        } else {
+          console.log(`GameRoom: Skipping game_ended for ${p.id} (${p.color}) - connected: ${p.connected}, hasConnection: ${!!p.connection}`);
+        }
+      } catch (sendError) {
+        console.error(`GameRoom: Error sending game_ended to ${p.id}:`, sendError);
       }
     }
 
@@ -1041,10 +1390,37 @@ export class GameRoom extends Server<GameRoomEnv> {
     };
 
     for (const p of this.players.values()) {
-      if (p.connected && p.connection) {
-        p.connection.send(JSON.stringify(systemMessage));
+      try {
+        if (p.connected && p.connection) {
+          p.connection.send(JSON.stringify(systemMessage));
+        }
+      } catch (e) {
+        console.error(`GameRoom: Error sending system message to ${p.id}:`, e);
       }
     }
+
+    // Clean up lobby from LobbyList if this was a lobby game (fire-and-forget)
+    console.error(`🏁🏁🏁 GameRoom.endGame LOBBY CLEANUP - isLobbyMode=${this.isLobbyMode}, lobbyId=${this.lobbyId}, timestamp=${Date.now()}`);
+    if (this.isLobbyMode && this.lobbyId) {
+      const lobbyIdToRemove = this.lobbyId;
+      console.error(`🏁🏁🏁 GameRoom.endGame REMOVING LOBBY - lobbyId=${lobbyIdToRemove}`);
+      (async () => {
+        try {
+          console.error(`🏁🏁🏁 ASYNC LOBBY CLEANUP: About to fetch DELETE for ${lobbyIdToRemove}`);
+          const lobbyListId = this.env.LOBBY_LIST.idFromName('global');
+          const lobbyListStub = this.env.LOBBY_LIST.get(lobbyListId);
+
+          await lobbyListStub.fetch(new Request(`https://lobby-list/remove/${lobbyIdToRemove}`, {
+            method: 'DELETE',
+          }));
+          console.error(`🏁🏁🏁 GameRoom: Lobby ${lobbyIdToRemove} removed from LobbyList after game end`);
+        } catch (error) {
+          console.error(`GameRoom: Failed to remove lobby ${lobbyIdToRemove} from LobbyList:`, error);
+        }
+      })();
+    }
+
+    console.error(`✅✅✅ GameRoom.endGame FUNCTION COMPLETE - gameStatus=${this.gameStatus}, timestamp=${Date.now()}`);
   }
 
   private sendReadyMessage(
@@ -1102,6 +1478,28 @@ export class GameRoom extends Server<GameRoomEnv> {
     // For Durable Objects, we'd need to make this async or use sync storage
     // For now, we'll initialize with defaults
     // TODO: Implement proper async state loading
+  }
+
+  /**
+   * Generate PGN notation from move history
+   */
+  private generatePgn(): string {
+    if (!this.moveHistory || this.moveHistory.length === 0) return '';
+
+    let pgn = '';
+    for (let i = 0; i < this.moveHistory.length; i++) {
+      const move = this.moveHistory[i];
+      // Use SAN notation if available, otherwise UCI
+      const notation = move.san || move.uci;
+      if (i % 2 === 0) {
+        // White's move - add move number
+        pgn += `${Math.floor(i / 2) + 1}. ${notation} `;
+      } else {
+        // Black's move
+        pgn += `${notation} `;
+      }
+    }
+    return pgn.trim();
   }
 
   // ============ TASK 5: WEBSOCKET CONNECTION SYNCHRONIZATION ============
@@ -1345,5 +1743,38 @@ export class GameRoom extends Server<GameRoomEnv> {
     } catch (error) {
       console.error(`GameRoom: Error sending game state to spectator ${spectatorId}:`, error);
     }
+  }
+
+  // Broadcast spectator count to all connected clients (players and spectators)
+  private broadcastSpectatorCount(): void {
+    const message = JSON.stringify({
+      type: "spectator_count",
+      count: this.spectators.size,
+      timestamp: Date.now(),
+    });
+
+    // Send to players
+    for (const player of this.players.values()) {
+      if (player.connected && player.connection) {
+        try {
+          player.connection.send(message);
+        } catch (error) {
+          console.error(`GameRoom: Error sending spectator count to player ${player.id}:`, error);
+        }
+      }
+    }
+
+    // Send to spectators
+    for (const spectator of this.spectators.values()) {
+      if (spectator.connection) {
+        try {
+          spectator.connection.send(message);
+        } catch (error) {
+          console.error(`GameRoom: Error sending spectator count to spectator ${spectator.id}:`, error);
+        }
+      }
+    }
+
+    console.log(`GameRoom: Broadcast spectator count: ${this.spectators.size}`);
   }
 }

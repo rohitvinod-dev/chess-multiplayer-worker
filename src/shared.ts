@@ -111,6 +111,8 @@ export type MatchHistoryData = {
   result: GameResult;
   resultReason: string;
   moves: MoveRecord[];
+  finalFen: string; // Final position FEN
+  pgn?: string; // Optional PGN notation
   startedAt: number;
   endedAt: number;
   openingName?: string; // Optional: name of opening used (for lobby matches)
@@ -163,6 +165,7 @@ export type GameMessage =
   | {
       type: "resign";
       resignedBy: string;
+      outcome?: string;
     }
   | {
       type: "clock_update";
