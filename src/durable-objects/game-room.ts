@@ -49,6 +49,7 @@ interface GameRoomEnv {
   GameRoom: DurableObjectNamespace;
   MATCHMAKING_QUEUE: DurableObjectNamespace;
   LOBBY_LIST: DurableObjectNamespace;
+  STATS_TRACKER: DurableObjectNamespace;
   ASSETS: Fetcher;
   FIREBASE_PROJECT_ID: string;
   FIREBASE_SERVICE_ACCOUNT: string;
@@ -559,6 +560,32 @@ export class GameRoom extends Server<GameRoomEnv> {
 
     this.gameStatus = "playing";
     console.log(`GameRoom: Game started at ${this.matchStartTime}`);
+
+    // Track game creation in stats (for both lobby and matchmaking games)
+    this.trackGameCreation();
+  }
+
+  private async trackGameCreation() {
+    try {
+      const roomId = this.lobbyId || this.party?.id || 'unknown';
+      const statsNamespace = this.env.STATS_TRACKER;
+      if (!statsNamespace) {
+        console.error('GameRoom: STATS_TRACKER namespace not available');
+        return;
+      }
+      const statsId = statsNamespace.idFromName('global-stats');
+      const statsStub = statsNamespace.get(statsId);
+      await statsStub.fetch(
+        new Request('https://internal/stats/game-created', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ gameId: roomId }),
+        })
+      );
+      console.log(`GameRoom: Tracked game creation for ${roomId}`);
+    } catch (error) {
+      console.error('GameRoom: Failed to track game creation:', error);
+    }
   }
 
   private handleMove(player: PlayerSession, data: any) {
