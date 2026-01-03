@@ -186,6 +186,7 @@ export interface EnsureUserProfileRequest {
   emailVerified?: boolean;
   displayName?: string;
   photoURL?: string;
+  countryCode?: string; // ISO 3166-1 alpha-2 code (e.g., "US", "IN", "GB")
 }
 
 export interface EnsureUserProfileResponse {

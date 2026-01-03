@@ -108,6 +108,15 @@ export async function handleEnsureUserProfile(
       payload.photoURL = body.photoURL.trim();
     }
 
+    // Validate and set country code (ISO 3166-1 alpha-2 format)
+    if (body.countryCode && typeof body.countryCode === 'string') {
+      const countryCode = body.countryCode.trim().toUpperCase();
+      // Basic validation: 2 uppercase letters
+      if (/^[A-Z]{2}$/.test(countryCode)) {
+        payload.countryCode = countryCode;
+      }
+    }
+
     // Update user profile
     await firestore.setDocument(`users/${user.uid}`, payload, { merge: true });
 

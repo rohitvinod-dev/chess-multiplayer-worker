@@ -1,9 +1,44 @@
 // ============ CHAT TYPES ============
+export type ChatRole = "user" | "admin" | "moderator" | "system";
+
 export type ChatMessage = {
   id: string;
   content: string;
-  user: string;
-  role: "user" | "assistant";
+  user: string; // display name (legacy, kept for compatibility)
+  userId: string;
+  displayName: string;
+  role: ChatRole;
+  timestamp: number; // Unix timestamp in milliseconds
+  metadata?: {
+    isPinned?: boolean;
+    pinnedAt?: number;
+    pinnedBy?: string;
+    isAnnouncement?: boolean;
+    announcementExpiresAt?: number;
+    [key: string]: unknown;
+  };
+};
+
+// Ban/mute info for users
+export type BanInfo = {
+  oderId: string;
+  oderedBy: string;
+  displayName: string;
+  reason?: string;
+  bannedAt: number;
+  expiresAt?: number; // undefined = permanent, timestamp = temporary
+  type: "ban" | "mute"; // ban = can't see/send, mute = can see but can't send
+};
+
+// Admin action result broadcast to clients
+export type AdminActionResult = {
+  success: boolean;
+  action: string;
+  targetUserId?: string;
+  messageId?: string;
+  error?: string;
+  performedBy: string;
+  timestamp: number;
 };
 
 export type Message =
@@ -12,18 +47,129 @@ export type Message =
       id: string;
       content: string;
       user: string;
-      role: "user" | "assistant";
+      userId: string;
+      displayName: string;
+      role: ChatRole;
+      timestamp: number;
+      metadata?: Record<string, unknown>;
     }
   | {
       type: "update";
       id: string;
       content: string;
       user: string;
-      role: "user" | "assistant";
+      userId: string;
+      displayName: string;
+      role: ChatRole;
+      timestamp: number;
+      metadata?: Record<string, unknown>;
     }
   | {
-      type: "all";
+      type: "delete";
+      id: string;
+      deletedBy?: string; // Admin who deleted (if admin action)
+    }
+  | {
+      type: "init"; // Initial messages on connect
       messages: ChatMessage[];
+      pinnedMessages?: ChatMessage[];
+      userBanStatus?: { isBanned: boolean; isMuted: boolean; expiresAt?: number; reason?: string };
+    }
+  | {
+      type: "all"; // Legacy alias for init
+      messages: ChatMessage[];
+    }
+  // ===== ADMIN ACTIONS =====
+  | {
+      type: "admin_delete"; // Admin deletes any message
+      messageId: string;
+      adminUserId: string;
+    }
+  | {
+      type: "admin_ban"; // Ban a user (can't see or send)
+      targetUserId: string;
+      reason?: string;
+      duration?: number; // minutes, undefined = permanent
+      adminUserId: string;
+    }
+  | {
+      type: "admin_unban"; // Unban a user
+      targetUserId: string;
+      adminUserId: string;
+    }
+  | {
+      type: "admin_mute"; // Mute a user (can see but can't send)
+      targetUserId: string;
+      reason?: string;
+      duration?: number; // minutes, undefined = permanent
+      adminUserId: string;
+    }
+  | {
+      type: "admin_unmute"; // Unmute a user
+      targetUserId: string;
+      adminUserId: string;
+    }
+  | {
+      type: "admin_pin"; // Pin a message
+      messageId: string;
+      adminUserId: string;
+    }
+  | {
+      type: "admin_unpin"; // Unpin a message
+      messageId: string;
+      adminUserId: string;
+    }
+  | {
+      type: "admin_announce"; // Create an announcement
+      content: string;
+      duration?: number; // hours, undefined = permanent
+      adminUserId: string;
+    }
+  // ===== ADMIN ACTION RESULTS (broadcast to clients) =====
+  | {
+      type: "user_banned";
+      targetUserId: string;
+      targetDisplayName: string;
+      reason?: string;
+      expiresAt?: number;
+      bannedBy: string;
+    }
+  | {
+      type: "user_unbanned";
+      targetUserId: string;
+      unbannedBy: string;
+    }
+  | {
+      type: "user_muted";
+      targetUserId: string;
+      targetDisplayName: string;
+      reason?: string;
+      expiresAt?: number;
+      mutedBy: string;
+    }
+  | {
+      type: "user_unmuted";
+      targetUserId: string;
+      unmutedBy: string;
+    }
+  | {
+      type: "message_pinned";
+      message: ChatMessage;
+      pinnedBy: string;
+    }
+  | {
+      type: "message_unpinned";
+      messageId: string;
+      unpinnedBy: string;
+    }
+  | {
+      type: "announcement";
+      message: ChatMessage;
+    }
+  | {
+      type: "error";
+      code: string;
+      message: string;
     };
 
 // ============ GAME TYPES ============

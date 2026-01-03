@@ -35,7 +35,7 @@ export function sanitizeUsername(raw?: string | null): string | null {
   const sanitized = trimmed.replace(/[^a-zA-Z0-9._-]/g, '_');
   if (!sanitized) return null;
   if (sanitized.toLowerCase() === 'no username') return null;
-  const truncated = sanitized.length > 12 ? sanitized.slice(0, 12) : sanitized;
+  const truncated = sanitized.length > 16 ? sanitized.slice(0, 16) : sanitized;
   if (truncated.length < 3) {
     return `${truncated}${'_'.repeat(3 - truncated.length)}`;
   }

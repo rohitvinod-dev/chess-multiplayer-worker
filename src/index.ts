@@ -29,7 +29,7 @@ import {
   type WSMessage,
   routePartykitRequest,
 } from "partyserver";
-import type { ChatMessage, Message, GameMode } from "./shared";
+import type { ChatMessage, Message, GameMode, ChatRole } from "./shared";
 
 // Export Durable Objects
 export { GameRoom } from './durable-objects/game-room';
@@ -64,66 +64,679 @@ export interface Env {
 }
 
 // ============ CHAT ROOM (from old index.ts) ============
+const MAX_MESSAGES = 100; // Keep only the most recent 100 messages
+
 export class Chat extends Server<Env> {
   static options = { hibernate: true };
 
   messages = [] as ChatMessage[];
+  pinnedMessages = [] as ChatMessage[];
+  
+  // Cache for admin/moderator status (userId -> role)
+  private adminCache = new Map<string, { role: ChatRole; expiresAt: number }>();
+  private static readonly ADMIN_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
   broadcastMessage(message: Message, exclude?: string[]) {
     this.broadcast(JSON.stringify(message), exclude);
   }
 
   onStart() {
-    // create the messages table if it doesn't exist
-    this.ctx.storage.sql.exec(
-      `CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, user TEXT, role TEXT, content TEXT)`,
-    );
+    // Create messages table
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS messages (
+        id TEXT PRIMARY KEY,
+        content TEXT NOT NULL,
+        user TEXT NOT NULL,
+        userId TEXT NOT NULL DEFAULT '',
+        displayName TEXT NOT NULL DEFAULT '',
+        role TEXT NOT NULL DEFAULT 'user',
+        timestamp INTEGER NOT NULL DEFAULT 0,
+        metadata TEXT
+      )
+    `);
 
-    // load the messages from the database
-    this.messages = this.ctx.storage.sql
-      .exec(`SELECT * FROM messages`)
-      .toArray() as ChatMessage[];
+    // Create banned_users table
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS banned_users (
+        oderId TEXT PRIMARY KEY,
+        oderedBy TEXT NOT NULL,
+        displayName TEXT NOT NULL DEFAULT '',
+        reason TEXT,
+        bannedAt INTEGER NOT NULL,
+        expiresAt INTEGER,
+        type TEXT NOT NULL DEFAULT 'ban'
+      )
+    `);
+
+    // Create pinned_messages table with full message content for persistence
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS pinned_messages (
+        messageId TEXT PRIMARY KEY,
+        pinnedBy TEXT NOT NULL,
+        pinnedAt INTEGER NOT NULL,
+        content TEXT,
+        userId TEXT,
+        displayName TEXT,
+        role TEXT,
+        timestamp INTEGER,
+        metadata TEXT
+      )
+    `);
+    // Migrate pinned_messages to include content columns
+    try {
+      this.ctx.storage.sql.exec(`ALTER TABLE pinned_messages ADD COLUMN content TEXT`);
+    } catch { /* column exists */ }
+    try {
+      this.ctx.storage.sql.exec(`ALTER TABLE pinned_messages ADD COLUMN userId TEXT`);
+    } catch { /* column exists */ }
+    try {
+      this.ctx.storage.sql.exec(`ALTER TABLE pinned_messages ADD COLUMN displayName TEXT`);
+    } catch { /* column exists */ }
+    try {
+      this.ctx.storage.sql.exec(`ALTER TABLE pinned_messages ADD COLUMN role TEXT`);
+    } catch { /* column exists */ }
+    try {
+      this.ctx.storage.sql.exec(`ALTER TABLE pinned_messages ADD COLUMN timestamp INTEGER`);
+    } catch { /* column exists */ }
+    try {
+      this.ctx.storage.sql.exec(`ALTER TABLE pinned_messages ADD COLUMN metadata TEXT`);
+    } catch { /* column exists */ }
+
+    // Migrate messages table columns
+    try {
+      this.ctx.storage.sql.exec(`ALTER TABLE messages ADD COLUMN userId TEXT NOT NULL DEFAULT ''`);
+    } catch { /* column exists */ }
+    try {
+      this.ctx.storage.sql.exec(`ALTER TABLE messages ADD COLUMN displayName TEXT NOT NULL DEFAULT ''`);
+    } catch { /* column exists */ }
+    try {
+      this.ctx.storage.sql.exec(`ALTER TABLE messages ADD COLUMN timestamp INTEGER NOT NULL DEFAULT 0`);
+    } catch { /* column exists */ }
+    try {
+      this.ctx.storage.sql.exec(`ALTER TABLE messages ADD COLUMN metadata TEXT`);
+    } catch { /* column exists */ }
+
+    // Cleanup expired bans/mutes
+    const now = Date.now();
+    this.ctx.storage.sql.exec(`DELETE FROM banned_users WHERE expiresAt IS NOT NULL AND expiresAt < ${now}`);
+
+    // Load messages
+    const rows = this.ctx.storage.sql
+      .exec(`SELECT * FROM messages ORDER BY timestamp DESC LIMIT ${MAX_MESSAGES}`)
+      .toArray();
+
+    this.messages = rows.reverse().map((row: Record<string, unknown>) => ({
+      id: String(row.id || ''),
+      content: String(row.content || ''),
+      user: String(row.user || row.displayName || ''),
+      userId: String(row.userId || ''),
+      displayName: String(row.displayName || row.user || ''),
+      role: (row.role as ChatMessage['role']) || 'user',
+      timestamp: Number(row.timestamp) || 0,
+      metadata: row.metadata ? JSON.parse(String(row.metadata)) : undefined,
+    }));
+
+    // Load pinned messages (from pinned_messages table which stores full content)
+    const pinnedRows = this.ctx.storage.sql
+      .exec(`SELECT * FROM pinned_messages ORDER BY pinnedAt DESC LIMIT 1`)
+      .toArray();
+
+    this.pinnedMessages = pinnedRows.map((row: Record<string, unknown>) => {
+      // Parse stored metadata or create new
+      let metadata: Record<string, unknown> = {};
+      if (row.metadata) {
+        try {
+          metadata = JSON.parse(String(row.metadata));
+        } catch { /* ignore parse errors */ }
+      }
+      
+      return {
+        id: String(row.messageId || ''),
+        content: String(row.content || ''),
+        user: String(row.displayName || ''),
+        userId: String(row.userId || ''),
+        displayName: String(row.displayName || ''),
+        role: (row.role as ChatMessage['role']) || 'user',
+        timestamp: Number(row.timestamp) || 0,
+        metadata: {
+          ...metadata,
+          isPinned: true,
+          pinnedAt: Number(row.pinnedAt) || 0,
+          pinnedBy: String(row.pinnedBy || ''),
+        },
+      };
+    });
   }
 
   onConnect(connection: Connection) {
+    // Get user's ban/mute status from connection URL params
+    const url = new URL(connection.url || 'http://localhost');
+    const oderId = url.searchParams.get('userId') || '';
+    const banStatus = this.getUserBanStatus(oderId);
+
     connection.send(
       JSON.stringify({
-        type: "all",
+        type: "init",
         messages: this.messages,
+        pinnedMessages: this.pinnedMessages,
+        userBanStatus: banStatus,
       } satisfies Message),
     );
   }
 
-  saveMessage(message: ChatMessage) {
-    const existingMessage = this.messages.find((m) => m.id === message.id);
-    if (existingMessage) {
-      this.messages = this.messages.map((m) => {
-        if (m.id === message.id) {
-          return message;
-        }
-        return m;
-      });
-    } else {
-      this.messages.push(message);
+  /**
+   * Get ban/mute status for a user
+   */
+  private getUserBanStatus(oderId: string): { isBanned: boolean; isMuted: boolean; expiresAt?: number; reason?: string } {
+    if (!oderId) return { isBanned: false, isMuted: false };
+
+    const now = Date.now();
+    const rows = this.ctx.storage.sql
+      .exec(`SELECT * FROM banned_users WHERE oderId = '${this.escapeSQL(oderId)}' 
+             AND (expiresAt IS NULL OR expiresAt > ${now})`)
+      .toArray();
+
+    if (rows.length === 0) {
+      return { isBanned: false, isMuted: false };
     }
 
-    this.ctx.storage.sql.exec(
-      `INSERT INTO messages (id, user, role, content) VALUES ('${
-        message.id
-      }', '${message.user}', '${message.role}', ${JSON.stringify(
-        message.content,
-      )}) ON CONFLICT (id) DO UPDATE SET content = ${JSON.stringify(
-        message.content,
-      )}`,
-    );
+    const row = rows[0] as Record<string, unknown>;
+    const type = String(row.type || 'ban');
+    
+    return {
+      isBanned: type === 'ban',
+      isMuted: type === 'mute',
+      expiresAt: row.expiresAt ? Number(row.expiresAt) : undefined,
+      reason: row.reason ? String(row.reason) : undefined,
+    };
   }
 
-  onMessage(connection: Connection, message: WSMessage) {
-    this.broadcast(message);
+  /**
+   * Check if user is banned or muted
+   */
+  private isUserRestricted(oderId: string): { restricted: boolean; type?: 'ban' | 'mute'; reason?: string } {
+    const status = this.getUserBanStatus(oderId);
+    if (status.isBanned) {
+      return { restricted: true, type: 'ban', reason: status.reason };
+    }
+    if (status.isMuted) {
+      return { restricted: true, type: 'mute', reason: status.reason };
+    }
+    return { restricted: false };
+  }
 
+  /**
+   * Validate user's role against Firestore admin_users collection.
+   */
+  private async validateRole(oderId: string, claimedRole: ChatRole): Promise<ChatRole> {
+    console.log(`Chat: validateRole called - userId: ${oderId}, claimedRole: ${claimedRole}`);
+    
+    if (claimedRole === 'user' || claimedRole === 'system') {
+      return claimedRole;
+    }
+
+    const cached = this.adminCache.get(oderId);
+    if (cached && cached.expiresAt > Date.now()) {
+      console.log(`Chat: Using cached role for ${oderId}: ${cached.role}`);
+      if (cached.role === 'admin') return claimedRole;
+      if (cached.role === 'moderator' && claimedRole === 'moderator') return 'moderator';
+      return 'user';
+    }
+
+    try {
+      const projectId = this.env.FIREBASE_PROJECT_ID;
+      console.log(`Chat: Fetching admin status from Firestore for project: ${projectId}`);
+      const serviceAccount = JSON.parse(this.env.FIREBASE_SERVICE_ACCOUNT);
+      const token = await this.getFirestoreAccessToken(serviceAccount);
+      
+      const adminDocUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/admin_users/${oderId}`;
+      console.log(`Chat: Fetching from: ${adminDocUrl}`);
+      const response = await fetch(adminDocUrl, {
+        headers: { 'Authorization': `Bearer ${token}` },
+      });
+
+      console.log(`Chat: Firestore response status: ${response.status}`);
+
+      if (response.ok) {
+        const doc = await response.json() as { fields?: { isAdmin?: { booleanValue?: boolean }; role?: { stringValue?: string } } };
+        console.log(`Chat: Firestore doc fields:`, JSON.stringify(doc.fields));
+        
+        if (doc.fields?.isAdmin?.booleanValue === true) {
+          const storedRole = doc.fields?.role?.stringValue as ChatRole || 'admin';
+          const validRole = storedRole === 'admin' || storedRole === 'moderator' ? storedRole : 'admin';
+          
+          this.adminCache.set(oderId, { role: validRole, expiresAt: Date.now() + Chat.ADMIN_CACHE_TTL });
+          console.log(`Chat: User ${oderId} validated as ${validRole}`);
+          return claimedRole === 'admin' && validRole === 'admin' ? 'admin' : 
+                 (validRole === 'admin' || validRole === 'moderator') ? validRole : 'user';
+        } else {
+          console.log(`Chat: isAdmin field not true for ${oderId}`);
+        }
+      } else {
+        const errorText = await response.text();
+        console.log(`Chat: Firestore error response: ${errorText}`);
+      }
+
+      this.adminCache.set(oderId, { role: 'user', expiresAt: Date.now() + Chat.ADMIN_CACHE_TTL });
+      console.log(`Chat: User ${oderId} set to 'user' role (not admin)`);
+      return 'user';
+    } catch (error) {
+      console.error(`Chat: Error validating role for ${oderId}:`, error);
+      return 'user';
+    }
+  }
+
+  /**
+   * Check if user has admin or moderator privileges
+   */
+  private async isAdminOrModerator(oderId: string): Promise<boolean> {
+    const role = await this.validateRole(oderId, 'admin');
+    return role === 'admin' || role === 'moderator';
+  }
+
+  /**
+   * Check if user is admin (not just moderator)
+   */
+  private async isAdmin(oderId: string): Promise<boolean> {
+    const role = await this.validateRole(oderId, 'admin');
+    return role === 'admin';
+  }
+
+  private async getFirestoreAccessToken(serviceAccount: { client_email: string; private_key: string }): Promise<string> {
+    const now = Math.floor(Date.now() / 1000);
+    const header = { alg: 'RS256', typ: 'JWT' };
+    const payload = {
+      iss: serviceAccount.client_email,
+      sub: serviceAccount.client_email,
+      aud: 'https://oauth2.googleapis.com/token',
+      iat: now,
+      exp: now + 3600,
+      scope: 'https://www.googleapis.com/auth/datastore',
+    };
+
+    const encoder = new TextEncoder();
+    const headerB64 = btoa(JSON.stringify(header)).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+    const payloadB64 = btoa(JSON.stringify(payload)).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+    const signatureInput = `${headerB64}.${payloadB64}`;
+
+    const pemHeader = '-----BEGIN PRIVATE KEY-----';
+    const pemFooter = '-----END PRIVATE KEY-----';
+    const pemContents = serviceAccount.private_key.replace(pemHeader, '').replace(pemFooter, '').replace(/\s/g, '');
+    const binaryKey = Uint8Array.from(atob(pemContents), c => c.charCodeAt(0));
+
+    const cryptoKey = await crypto.subtle.importKey(
+      'pkcs8', binaryKey, { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['sign']
+    );
+
+    const signature = await crypto.subtle.sign('RSASSA-PKCS1-v1_5', cryptoKey, encoder.encode(signatureInput));
+    const signatureB64 = btoa(String.fromCharCode(...new Uint8Array(signature))).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+    const jwt = `${signatureInput}.${signatureB64}`;
+
+    const tokenResponse = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${jwt}`,
+    });
+
+    const tokenData = await tokenResponse.json() as { access_token: string };
+    return tokenData.access_token;
+  }
+
+  // ===== MESSAGE MANAGEMENT =====
+
+  saveMessage(message: ChatMessage) {
+    const existingIndex = this.messages.findIndex((m) => m.id === message.id);
+
+    if (existingIndex >= 0) {
+      this.messages[existingIndex] = message;
+    } else {
+      this.messages.push(message);
+      if (this.messages.length > MAX_MESSAGES) {
+        const toDelete = this.messages.splice(0, this.messages.length - MAX_MESSAGES);
+        for (const msg of toDelete) {
+          this.ctx.storage.sql.exec(`DELETE FROM messages WHERE id = '${this.escapeSQL(msg.id)}'`);
+          // Note: We do NOT delete from pinned_messages - pinned messages persist beyond the 100 message limit
+          // They are stored with full content and only deleted on explicit unpin
+        }
+      }
+    }
+
+    const escapedId = this.escapeSQL(message.id);
+    const escapedContent = this.escapeSQL(message.content);
+    const escapedUser = this.escapeSQL(message.user || message.displayName);
+    const escapedUserId = this.escapeSQL(message.userId || '');
+    const escapedDisplayName = this.escapeSQL(message.displayName || message.user);
+    const escapedRole = this.escapeSQL(message.role || 'user');
+    const timestamp = message.timestamp || Date.now();
+    const metadataJson = message.metadata ? this.escapeSQL(JSON.stringify(message.metadata)) : null;
+
+    this.ctx.storage.sql.exec(`
+      INSERT INTO messages (id, content, user, userId, displayName, role, timestamp, metadata)
+      VALUES ('${escapedId}', '${escapedContent}', '${escapedUser}', '${escapedUserId}',
+              '${escapedDisplayName}', '${escapedRole}', ${timestamp}, ${metadataJson ? `'${metadataJson}'` : 'NULL'})
+      ON CONFLICT (id) DO UPDATE SET content = '${escapedContent}', metadata = ${metadataJson ? `'${metadataJson}'` : 'NULL'}
+    `);
+  }
+
+  deleteMessage(messageId: string) {
+    this.messages = this.messages.filter((m) => m.id !== messageId);
+    this.pinnedMessages = this.pinnedMessages.filter((m) => m.id !== messageId);
+    this.ctx.storage.sql.exec(`DELETE FROM messages WHERE id = '${this.escapeSQL(messageId)}'`);
+    this.ctx.storage.sql.exec(`DELETE FROM pinned_messages WHERE messageId = '${this.escapeSQL(messageId)}'`);
+  }
+
+  // ===== ADMIN ACTIONS =====
+
+  private async handleAdminDelete(adminUserId: string, messageId: string): Promise<void> {
+    console.log(`Chat: handleAdminDelete called - adminUserId: ${adminUserId}, messageId: ${messageId}`);
+    const isAuthorized = await this.isAdminOrModerator(adminUserId);
+    console.log(`Chat: isAdminOrModerator result: ${isAuthorized}`);
+    
+    if (!isAuthorized) {
+      console.log(`Chat: User ${adminUserId} not authorized to delete messages`);
+      // Send error back to the user
+      this.broadcast(JSON.stringify({ 
+        type: 'error', 
+        message: 'Not authorized to delete messages',
+        userId: adminUserId 
+      }));
+      return;
+    }
+
+    this.deleteMessage(messageId);
+    this.broadcast(JSON.stringify({ type: 'delete', id: messageId, deletedBy: adminUserId }));
+    console.log(`Chat: Admin ${adminUserId} deleted message ${messageId}`);
+  }
+
+  private async handleBan(adminUserId: string, targetUserId: string, reason?: string, durationMinutes?: number): Promise<void> {
+    if (!await this.isAdminOrModerator(adminUserId)) {
+      console.log(`Chat: User ${adminUserId} not authorized to ban users`);
+      return;
+    }
+
+    // Get target user display name from recent messages
+    const targetMessage = this.messages.find(m => m.userId === targetUserId);
+    const displayName = targetMessage?.displayName || 'Unknown';
+
+    const bannedAt = Date.now();
+    const expiresAt = durationMinutes ? bannedAt + (durationMinutes * 60 * 1000) : null;
+
+    this.ctx.storage.sql.exec(`
+      INSERT INTO banned_users (oderId, oderedBy, displayName, reason, bannedAt, expiresAt, type)
+      VALUES ('${this.escapeSQL(targetUserId)}', '${this.escapeSQL(adminUserId)}', '${this.escapeSQL(displayName)}',
+              ${reason ? `'${this.escapeSQL(reason)}'` : 'NULL'}, ${bannedAt}, ${expiresAt || 'NULL'}, 'ban')
+      ON CONFLICT (oderId) DO UPDATE SET 
+        oderedBy = '${this.escapeSQL(adminUserId)}', reason = ${reason ? `'${this.escapeSQL(reason)}'` : 'NULL'},
+        bannedAt = ${bannedAt}, expiresAt = ${expiresAt || 'NULL'}, type = 'ban'
+    `);
+
+    this.broadcast(JSON.stringify({
+      type: 'user_banned',
+      targetUserId,
+      targetDisplayName: displayName,
+      reason,
+      expiresAt: expiresAt || undefined,
+      bannedBy: adminUserId,
+    }));
+
+    console.log(`Chat: Admin ${adminUserId} banned user ${targetUserId} (${displayName})`);
+  }
+
+  private async handleUnban(adminUserId: string, targetUserId: string): Promise<void> {
+    if (!await this.isAdminOrModerator(adminUserId)) {
+      console.log(`Chat: User ${adminUserId} not authorized to unban users`);
+      return;
+    }
+
+    this.ctx.storage.sql.exec(`DELETE FROM banned_users WHERE oderId = '${this.escapeSQL(targetUserId)}'`);
+
+    this.broadcast(JSON.stringify({
+      type: 'user_unbanned',
+      targetUserId,
+      unbannedBy: adminUserId,
+    }));
+
+    console.log(`Chat: Admin ${adminUserId} unbanned user ${targetUserId}`);
+  }
+
+  private async handleMute(adminUserId: string, targetUserId: string, reason?: string, durationMinutes?: number): Promise<void> {
+    if (!await this.isAdminOrModerator(adminUserId)) {
+      console.log(`Chat: User ${adminUserId} not authorized to mute users`);
+      return;
+    }
+
+    const targetMessage = this.messages.find(m => m.userId === targetUserId);
+    const displayName = targetMessage?.displayName || 'Unknown';
+
+    const mutedAt = Date.now();
+    const expiresAt = durationMinutes ? mutedAt + (durationMinutes * 60 * 1000) : null;
+
+    this.ctx.storage.sql.exec(`
+      INSERT INTO banned_users (oderId, oderedBy, displayName, reason, bannedAt, expiresAt, type)
+      VALUES ('${this.escapeSQL(targetUserId)}', '${this.escapeSQL(adminUserId)}', '${this.escapeSQL(displayName)}',
+              ${reason ? `'${this.escapeSQL(reason)}'` : 'NULL'}, ${mutedAt}, ${expiresAt || 'NULL'}, 'mute')
+      ON CONFLICT (oderId) DO UPDATE SET 
+        oderedBy = '${this.escapeSQL(adminUserId)}', reason = ${reason ? `'${this.escapeSQL(reason)}'` : 'NULL'},
+        bannedAt = ${mutedAt}, expiresAt = ${expiresAt || 'NULL'}, type = 'mute'
+    `);
+
+    this.broadcast(JSON.stringify({
+      type: 'user_muted',
+      targetUserId,
+      targetDisplayName: displayName,
+      reason,
+      expiresAt: expiresAt || undefined,
+      mutedBy: adminUserId,
+    }));
+
+    console.log(`Chat: Admin ${adminUserId} muted user ${targetUserId} (${displayName})`);
+  }
+
+  private async handleUnmute(adminUserId: string, targetUserId: string): Promise<void> {
+    if (!await this.isAdminOrModerator(adminUserId)) {
+      console.log(`Chat: User ${adminUserId} not authorized to unmute users`);
+      return;
+    }
+
+    this.ctx.storage.sql.exec(`DELETE FROM banned_users WHERE oderId = '${this.escapeSQL(targetUserId)}' AND type = 'mute'`);
+
+    this.broadcast(JSON.stringify({
+      type: 'user_unmuted',
+      targetUserId,
+      unmutedBy: adminUserId,
+    }));
+
+    console.log(`Chat: Admin ${adminUserId} unmuted user ${targetUserId}`);
+  }
+
+  private async handlePin(adminUserId: string, messageId: string): Promise<void> {
+    if (!await this.isAdminOrModerator(adminUserId)) {
+      console.log(`Chat: User ${adminUserId} not authorized to pin messages`);
+      return;
+    }
+
+    const message = this.messages.find(m => m.id === messageId);
+    if (!message) {
+      console.log(`Chat: Message ${messageId} not found for pinning`);
+      return;
+    }
+
+    // Only 1 pinned message allowed - unpin existing first
+    if (this.pinnedMessages.length > 0) {
+      const existingPinned = this.pinnedMessages[0];
+      this.ctx.storage.sql.exec(`DELETE FROM pinned_messages WHERE messageId != '${this.escapeSQL(messageId)}'`);
+      this.pinnedMessages = [];
+      
+      // Broadcast unpin for old message
+      this.broadcast(JSON.stringify({
+        type: 'message_unpinned',
+        messageId: existingPinned.id,
+        unpinnedBy: adminUserId,
+      }));
+      console.log(`Chat: Auto-unpinned previous message ${existingPinned.id}`);
+    }
+
+    const pinnedAt = Date.now();
+    const metadataJson = JSON.stringify({ ...message.metadata, isPinned: true, pinnedAt, pinnedBy: adminUserId });
+    
+    // Store full message content for persistence beyond 100 message limit
+    this.ctx.storage.sql.exec(`
+      INSERT INTO pinned_messages (messageId, pinnedBy, pinnedAt, content, userId, displayName, role, timestamp, metadata)
+      VALUES (
+        '${this.escapeSQL(messageId)}', 
+        '${this.escapeSQL(adminUserId)}', 
+        ${pinnedAt},
+        '${this.escapeSQL(message.content)}',
+        '${this.escapeSQL(message.userId)}',
+        '${this.escapeSQL(message.displayName)}',
+        '${this.escapeSQL(message.role || 'user')}',
+        ${message.timestamp},
+        '${this.escapeSQL(metadataJson)}'
+      )
+      ON CONFLICT (messageId) DO UPDATE SET
+        pinnedBy = '${this.escapeSQL(adminUserId)}',
+        pinnedAt = ${pinnedAt},
+        metadata = '${this.escapeSQL(metadataJson)}'
+    `);
+
+    const pinnedMessage: ChatMessage = {
+      ...message,
+      metadata: { ...message.metadata, isPinned: true, pinnedAt, pinnedBy: adminUserId },
+    };
+
+    this.pinnedMessages = [pinnedMessage];
+
+    this.broadcast(JSON.stringify({
+      type: 'message_pinned',
+      message: pinnedMessage,
+      pinnedBy: adminUserId,
+    }));
+
+    console.log(`Chat: Admin ${adminUserId} pinned message ${messageId}`);
+  }
+
+  private async handleUnpin(adminUserId: string, messageId: string): Promise<void> {
+    if (!await this.isAdminOrModerator(adminUserId)) {
+      console.log(`Chat: User ${adminUserId} not authorized to unpin messages`);
+      return;
+    }
+
+    this.ctx.storage.sql.exec(`DELETE FROM pinned_messages WHERE messageId = '${this.escapeSQL(messageId)}'`);
+    this.pinnedMessages = this.pinnedMessages.filter(m => m.id !== messageId);
+
+    this.broadcast(JSON.stringify({
+      type: 'message_unpinned',
+      messageId,
+      unpinnedBy: adminUserId,
+    }));
+
+    console.log(`Chat: Admin ${adminUserId} unpinned message ${messageId}`);
+  }
+
+  private async handleAnnounce(adminUserId: string, content: string, durationHours?: number): Promise<void> {
+    if (!await this.isAdmin(adminUserId)) {
+      console.log(`Chat: User ${adminUserId} not authorized to create announcements`);
+      return;
+    }
+
+    const cached = this.adminCache.get(adminUserId);
+    const adminRole = cached?.role || 'admin';
+
+    const announcement: ChatMessage = {
+      id: `announce-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+      content,
+      user: 'System',
+      userId: adminUserId,
+      displayName: 'Announcement',
+      role: 'system',
+      timestamp: Date.now(),
+      metadata: {
+        isAnnouncement: true,
+        announcementExpiresAt: durationHours ? Date.now() + (durationHours * 60 * 60 * 1000) : undefined,
+      },
+    };
+
+    this.saveMessage(announcement);
+    this.broadcast(JSON.stringify({ type: 'announcement', message: announcement }));
+
+    console.log(`Chat: Admin ${adminUserId} created announcement`);
+  }
+
+  private escapeSQL(value: string): string {
+    return value.replace(/'/g, "''");
+  }
+
+  async onMessage(connection: Connection, message: WSMessage) {
     const parsed = JSON.parse(message as string) as Message;
+
+    // Handle admin actions
+    if (parsed.type === 'admin_delete') {
+      await this.handleAdminDelete(parsed.adminUserId, parsed.messageId);
+      return;
+    }
+    if (parsed.type === 'admin_ban') {
+      await this.handleBan(parsed.adminUserId, parsed.targetUserId, parsed.reason, parsed.duration);
+      return;
+    }
+    if (parsed.type === 'admin_unban') {
+      await this.handleUnban(parsed.adminUserId, parsed.targetUserId);
+      return;
+    }
+    if (parsed.type === 'admin_mute') {
+      await this.handleMute(parsed.adminUserId, parsed.targetUserId, parsed.reason, parsed.duration);
+      return;
+    }
+    if (parsed.type === 'admin_unmute') {
+      await this.handleUnmute(parsed.adminUserId, parsed.targetUserId);
+      return;
+    }
+    if (parsed.type === 'admin_pin') {
+      await this.handlePin(parsed.adminUserId, parsed.messageId);
+      return;
+    }
+    if (parsed.type === 'admin_unpin') {
+      await this.handleUnpin(parsed.adminUserId, parsed.messageId);
+      return;
+    }
+    if (parsed.type === 'admin_announce') {
+      await this.handleAnnounce(parsed.adminUserId, parsed.content, parsed.duration);
+      return;
+    }
+
     if (parsed.type === "add" || parsed.type === "update") {
-      this.saveMessage(parsed);
+      // Check if user is banned or muted
+      const restriction = this.isUserRestricted(parsed.userId || '');
+      if (restriction.restricted) {
+        connection.send(JSON.stringify({
+          type: 'error',
+          code: restriction.type === 'ban' ? 'USER_BANNED' : 'USER_MUTED',
+          message: restriction.reason || (restriction.type === 'ban' ? 'You are banned from chat' : 'You are muted'),
+        }));
+        return;
+      }
+
+      const claimedRole = parsed.role || 'user';
+      const validatedRole = await this.validateRole(parsed.userId || '', claimedRole);
+      
+      const msgWithTimestamp: ChatMessage = {
+        id: parsed.id,
+        content: parsed.content,
+        user: parsed.user,
+        userId: parsed.userId || '',
+        displayName: parsed.displayName || parsed.user,
+        role: validatedRole,
+        timestamp: parsed.timestamp || Date.now(),
+        metadata: parsed.metadata,
+      };
+
+      this.saveMessage(msgWithTimestamp);
+      this.broadcast(JSON.stringify({ ...parsed, role: validatedRole, timestamp: msgWithTimestamp.timestamp }));
+    } else if (parsed.type === "delete") {
+      // Regular users can only delete their own messages (handled client-side)
+      this.deleteMessage(parsed.id);
+      this.broadcast(message);
+    } else {
+      this.broadcast(message);
     }
   }
 }
