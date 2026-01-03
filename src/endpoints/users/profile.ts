@@ -134,6 +134,12 @@ export async function handleEnsureUserProfile(
       updatedAt: formatTimestamp(now),
     };
 
+    // Include countryCode if set
+    const countryCode = payload.countryCode || existingData.countryCode;
+    if (countryCode) {
+      leaderboardPayload.countryCode = countryCode;
+    }
+
     await firestore.setDocument(`leaderboard/${user.uid}`, leaderboardPayload, { merge: true });
 
     return new Response(
