@@ -11,6 +11,9 @@ import { handleUpdateNotificationPreferences } from './endpoints/notifications/p
 import { handleTrackNotificationOpened } from './endpoints/notifications/track';
 import { handleManageOpenings } from './endpoints/openings/manage';
 import { handleSyncAchievements } from './endpoints/achievements/sync';
+import { handleMigrateUsernames } from './endpoints/admin/migrate-usernames';
+import { handleSyncRatingsToLeaderboard } from './endpoints/admin/sync-ratings-to-leaderboard';
+import { handleMigrateEloModes } from './endpoints/admin/migrate-elo-modes';
 import { createLobbyHandler } from './endpoints/lobby/create';
 import { listLobbiesHandler } from './endpoints/lobby/list';
 import { joinLobbyHandler } from './endpoints/lobby/join';
@@ -1645,15 +1648,15 @@ export default {
           );
         }
 
-        const results = await firestore.queryDocuments('users', [
-          { field: 'username', op: 'EQUAL', value: username },
-        ]);
+        // Check the atomic usernames collection for uniqueness
+        // This is the single source of truth for username ownership
+        const usernameLower = username.toLowerCase();
+        const existingClaim = await firestore.getDocument(`usernames/${usernameLower}`);
 
         // Username is unique if:
-        // 1. No results found, OR
-        // 2. Only result is the current user's own username
-        const isUnique = results.length === 0 ||
-          (results.length === 1 && results[0]._id === user.uid);
+        // 1. No claim exists in the registry, OR
+        // 2. The claim belongs to the current user (they can keep their own username)
+        const isUnique = !existingClaim || existingClaim.uid === user.uid;
 
         return new Response(
           JSON.stringify({ isUnique }),
@@ -1808,6 +1811,44 @@ export default {
           status: 200,
           headers: { ...corsHeaders, 'Content-Type': 'application/json' },
         });
+      }
+
+      // ========== ADMIN ENDPOINTS ==========
+
+      if (url.pathname === '/api/admin/migrate-usernames' && request.method === 'GET') {
+        // Verify admin secret
+        const adminSecret = request.headers.get('X-Admin-Secret');
+        if (adminSecret !== 'checkmatex-admin-2024') {
+          return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+            status: 401,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+        return handleMigrateUsernames(request, env);
+      }
+
+      if (url.pathname === '/api/admin/sync-ratings-to-leaderboard' && request.method === 'GET') {
+        // Verify admin secret
+        const adminSecret = request.headers.get('X-Admin-Secret');
+        if (adminSecret !== 'checkmatex-admin-2024') {
+          return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+            status: 401,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+        return handleSyncRatingsToLeaderboard(request, env);
+      }
+
+      if (url.pathname === '/api/admin/migrate-elo-modes' && request.method === 'GET') {
+        // Verify admin secret
+        const adminSecret = request.headers.get('X-Admin-Secret');
+        if (adminSecret !== 'checkmatex-admin-2024') {
+          return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+            status: 401,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+        return handleMigrateEloModes(request, env);
       }
 
       // ========== STATS ENDPOINTS ==========

@@ -272,6 +272,59 @@ export class FirestoreClient {
   }
 
   /**
+   * List documents in a collection with pagination
+   * @param collectionPath - Collection path (e.g., "users")
+   * @param options - Pagination options
+   * @returns Object with documents and optional nextPageToken
+   */
+  async listDocuments(
+    collectionPath: string,
+    options?: { pageSize?: number; pageToken?: string; orderBy?: string }
+  ): Promise<{ documents: Array<{ id: string; data: any }>; nextPageToken?: string }> {
+    const token = await this.getAccessToken();
+    let url = `https://firestore.googleapis.com/v1/projects/${this.projectId}/databases/(default)/documents/${collectionPath}`;
+
+    const params: string[] = [];
+    if (options?.pageSize) {
+      params.push(`pageSize=${options.pageSize}`);
+    }
+    if (options?.pageToken) {
+      params.push(`pageToken=${encodeURIComponent(options.pageToken)}`);
+    }
+    if (options?.orderBy) {
+      params.push(`orderBy=${encodeURIComponent(options.orderBy)}`);
+    }
+
+    if (params.length > 0) {
+      url += `?${params.join('&')}`;
+    }
+
+    const response = await fetch(url, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+
+    if (!response.ok) {
+      const body = await response.text();
+      throw new Error(`Firestore LIST failed: ${response.statusText} - ${body}`);
+    }
+
+    const result = await response.json() as {
+      documents?: FirestoreDocument[];
+      nextPageToken?: string;
+    };
+
+    const documents = (result.documents || []).map(doc => ({
+      id: doc.name.split('/').pop() || '',
+      data: this.parseDocument(doc),
+    }));
+
+    return {
+      documents,
+      nextPageToken: result.nextPageToken,
+    };
+  }
+
+  /**
    * Query documents in a collection
    */
   async queryDocuments(

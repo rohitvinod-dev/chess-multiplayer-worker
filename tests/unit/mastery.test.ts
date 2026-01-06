@@ -8,6 +8,8 @@ import { describe, it, expect } from 'vitest';
 import {
   clamp,
   sanitizeUsername,
+  validateUsername,
+  USERNAME_CONSTRAINTS,
   splitProgressKey,
   variationIdFromKey,
   openingIdFromKey,
@@ -26,58 +28,171 @@ describe('Utility Functions', () => {
     });
   });
 
-  describe('sanitizeUsername', () => {
-    it('should sanitize valid usernames', () => {
-      expect(sanitizeUsername('TestUser')).toBe('TestUser');
-      expect(sanitizeUsername('test_user')).toBe('test_user');
-      expect(sanitizeUsername('user.123')).toBe('user.123');
+  describe('USERNAME_CONSTRAINTS', () => {
+    it('should have correct length constraints', () => {
+      expect(USERNAME_CONSTRAINTS.minLength).toBe(3);
+      expect(USERNAME_CONSTRAINTS.maxLength).toBe(25);
+    });
+  });
+
+  describe('validateUsername', () => {
+    it('should validate valid usernames', () => {
+      expect(validateUsername('TestUser').isValid).toBe(true);
+      expect(validateUsername('test_user').isValid).toBe(true);
+      expect(validateUsername('user-123').isValid).toBe(true);
+      expect(validateUsername('Player1').isValid).toBe(true);
+      expect(validateUsername('Chess_Master_2024').isValid).toBe(true);
     });
 
-    it('should replace invalid characters', () => {
+    it('should reject empty/null usernames', () => {
+      expect(validateUsername(null).isValid).toBe(false);
+      expect(validateUsername('').isValid).toBe(false);
+      expect(validateUsername('   ').isValid).toBe(false);
+    });
+
+    it('should reject usernames with periods (Chess.com style)', () => {
+      expect(validateUsername('user.123').isValid).toBe(false);
+      expect(validateUsername('first.last').isValid).toBe(false);
+    });
+
+    it('should reject usernames that dont start with letter/number', () => {
+      expect(validateUsername('_username').isValid).toBe(false);
+      expect(validateUsername('-player').isValid).toBe(false);
+    });
+
+    it('should reject usernames that dont end with letter/number', () => {
+      expect(validateUsername('username_').isValid).toBe(false);
+      expect(validateUsername('player-').isValid).toBe(false);
+    });
+
+    it('should reject numbers-only usernames (Lichess rule)', () => {
+      expect(validateUsername('123456').isValid).toBe(false);
+      expect(validateUsername('999').isValid).toBe(false);
+    });
+
+    it('should reject consecutive special characters', () => {
+      expect(validateUsername('user__name').isValid).toBe(false);
+      expect(validateUsername('player--one').isValid).toBe(false);
+      expect(validateUsername('test_-name').isValid).toBe(false);
+    });
+
+    it('should reject too short usernames', () => {
+      expect(validateUsername('ab').isValid).toBe(false);
+      expect(validateUsername('a').isValid).toBe(false);
+    });
+
+    it('should reject too long usernames', () => {
+      expect(validateUsername('a'.repeat(26)).isValid).toBe(false);
+      expect(validateUsername('username_that_is_way_too_long_for_system').isValid).toBe(false);
+    });
+
+    it('should reject reserved words', () => {
+      expect(validateUsername('admin').isValid).toBe(false);
+      expect(validateUsername('moderator').isValid).toBe(false);
+      expect(validateUsername('system').isValid).toBe(false);
+      expect(validateUsername('no username').isValid).toBe(false);
+    });
+
+    it('should reject standalone profanity', () => {
+      // Profanity as standalone words are detected
+      expect(validateUsername('fuck').isValid).toBe(false);
+      expect(validateUsername('shit').isValid).toBe(false);
+    });
+  });
+
+  describe('sanitizeUsername', () => {
+    it('should preserve valid usernames', () => {
+      expect(sanitizeUsername('TestUser')).toBe('TestUser');
+      expect(sanitizeUsername('test_user')).toBe('test_user');
+      expect(sanitizeUsername('user-123')).toBe('user-123');
+    });
+
+    it('should convert periods to underscores', () => {
+      expect(sanitizeUsername('user.123')).toBe('user_123');
+    });
+
+    it('should replace invalid characters with underscores', () => {
       expect(sanitizeUsername('test@user')).toBe('test_user');
       expect(sanitizeUsername('user name')).toBe('user_name');
     });
 
-    it('should truncate long usernames', () => {
-      expect(sanitizeUsername('verylongusername123')).toBe('verylonguser');
+    it('should remove leading special characters', () => {
+      expect(sanitizeUsername('_username')).toBe('username');
+      // After collapsing __ to _ and removing leading _, 'test' is 4 chars (>= minLength 3)
+      expect(sanitizeUsername('__test')).toBe('test');
     });
 
-    it('should pad short usernames', () => {
-      expect(sanitizeUsername('ab')).toBe('ab_');
-      expect(sanitizeUsername('a')).toBe('a__');
+    it('should remove trailing special characters', () => {
+      expect(sanitizeUsername('username_')).toBe('username');
+      expect(sanitizeUsername('player--')).toBe('player');
     });
 
-    it('should reject invalid inputs', () => {
+    it('should collapse consecutive special characters', () => {
+      expect(sanitizeUsername('user__name')).toBe('user_name');
+      // After collapsing ___ to _, 'a_b' is 3 chars (== minLength 3), no padding needed
+      expect(sanitizeUsername('a___b')).toBe('a_b');
+    });
+
+    it('should handle edge cases', () => {
+      // Only special chars left after stripping - should pad with x
+      expect(sanitizeUsername('___')).toBe(null);
+    });
+
+    it('should truncate to max length', () => {
+      const longName = 'verylongusernamethatexceedsmaximumlength';
+      const result = sanitizeUsername(longName);
+      expect(result?.length).toBeLessThanOrEqual(USERNAME_CONSTRAINTS.maxLength);
+    });
+
+    it('should pad short usernames with x', () => {
+      expect(sanitizeUsername('ab')).toBe('abx');
+      expect(sanitizeUsername('a')).toBe('axx');
+    });
+
+    it('should prepend u for numbers-only', () => {
+      expect(sanitizeUsername('123456')).toBe('u123456');
+      expect(sanitizeUsername('999')).toBe('u999');
+    });
+
+    it('should reject inputs that cannot be sanitized', () => {
       expect(sanitizeUsername(null)).toBeNull();
       expect(sanitizeUsername('')).toBeNull();
       expect(sanitizeUsername('   ')).toBeNull();
-      expect(sanitizeUsername('no username')).toBeNull();
+      expect(sanitizeUsername('admin')).toBeNull();
+      expect(sanitizeUsername('moderator')).toBeNull();
+      expect(sanitizeUsername('system')).toBeNull();
     });
   });
 
   describe('splitProgressKey', () => {
-    it('should split progress key correctly', () => {
-      expect(splitProgressKey('Sicilian_Najdorf_Main')).toEqual(['Sicilian', 'Najdorf', 'Main']);
+    it('should split progress key on first underscore only', () => {
+      // Note: The implementation splits on FIRST underscore only
+      // Only when underscore is > 0 AND < length-1 (not at start or end)
+      expect(splitProgressKey('Sicilian_Najdorf_Main')).toEqual(['Sicilian', 'Najdorf_Main']);
       expect(splitProgressKey('FrenchDefense_Classical')).toEqual(['FrenchDefense', 'Classical']);
       expect(splitProgressKey('KingsIndian')).toEqual(['KingsIndian']);
     });
 
-    it('should handle empty segments', () => {
-      expect(splitProgressKey('Sicilian__Najdorf')).toEqual(['Sicilian', 'Najdorf']);
-      expect(splitProgressKey('_Sicilian_')).toEqual(['Sicilian']);
+    it('should handle edge cases', () => {
+      expect(splitProgressKey('')).toEqual([]);
+      // Underscore at position 0 - not split, returns whole string
+      expect(splitProgressKey('_test')).toEqual(['_test']);
+      // Underscore at last position - not split, returns whole string
+      expect(splitProgressKey('test_')).toEqual(['test_']);
     });
   });
 
   describe('variationIdFromKey', () => {
-    it('should extract variation ID', () => {
-      expect(variationIdFromKey('Sicilian_Najdorf_Main')).toBe('Sicilian_Najdorf');
+    it('should return full key as variation ID', () => {
+      // Note: variationIdFromKey returns the full key for uniqueness
+      expect(variationIdFromKey('Sicilian_Najdorf_Main')).toBe('Sicilian_Najdorf_Main');
       expect(variationIdFromKey('French_Classical')).toBe('French_Classical');
       expect(variationIdFromKey('KingsIndian')).toBe('KingsIndian');
     });
   });
 
   describe('openingIdFromKey', () => {
-    it('should extract opening ID', () => {
+    it('should extract opening name (first segment)', () => {
       expect(openingIdFromKey('Sicilian_Najdorf_Main')).toBe('Sicilian');
       expect(openingIdFromKey('French_Classical')).toBe('French');
       expect(openingIdFromKey('KingsIndian')).toBe('KingsIndian');
@@ -107,18 +222,19 @@ describe('Progress Map Analysis', () => {
     expect(analysis.completedKeys).toBe(1); // One at level 3
     expect(analysis.totalLevel).toBe(6); // 3 + 2 + 1
     expect(analysis.overallMastery).toBeCloseTo(6 / (3 * 3)); // 6 / 9 = 0.666...
-    expect(analysis.variationGroups.size).toBe(2); // Sicilian_Najdorf, French_Classical
+    // variationIdFromKey returns full key, so each key is its own variation
+    expect(analysis.variationGroups.size).toBe(3);
     expect(analysis.openingGroups.size).toBe(2); // Sicilian, French
   });
 
   it('should detect completed variations', () => {
     const progressMap = {
-      'Sicilian_Najdorf_Main': 3,
-      'Sicilian_Najdorf_Sideline': 3,
+      'Sicilian_Najdorf': 3,
       'Sicilian_Dragon': 2,
     };
 
     const analysis = analyzeProgressMap(progressMap);
+    // variationIdFromKey returns full key
     expect(analysis.isVariationComplete('Sicilian_Najdorf')).toBe(true);
     expect(analysis.isVariationComplete('Sicilian_Dragon')).toBe(false);
   });

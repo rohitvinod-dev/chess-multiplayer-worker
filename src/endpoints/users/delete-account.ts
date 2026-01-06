@@ -244,76 +244,22 @@ export async function handleDeleteAccount(
       errors.push(`leaderboard: ${error}`);
     }
 
-    // Delete from mastery leaderboard
+    // Delete from unified leaderboard
     try {
-      console.log(`[DeleteAccount] Deleting from mastery leaderboard`);
-      const masteryPath = `leaderboards/mastery/players/${userId}`;
-      const mastery = await firestore.getDocument(masteryPath);
+      console.log(`[DeleteAccount] Deleting from unified leaderboard`);
+      const leaderboardPath = `leaderboard/${userId}`;
+      const leaderboardEntry = await firestore.getDocument(leaderboardPath);
 
-      if (mastery) {
-        await firestore.deleteDocument(masteryPath);
-        deletedCollections.push('leaderboards/mastery');
-        console.log(`[DeleteAccount] Deleted mastery leaderboard entry`);
+      if (leaderboardEntry) {
+        await firestore.deleteDocument(leaderboardPath);
+        deletedCollections.push('leaderboard');
+        console.log(`[DeleteAccount] Deleted leaderboard entry`);
       } else {
-        console.log(`[DeleteAccount] No mastery leaderboard entry found, skipping`);
+        console.log(`[DeleteAccount] No leaderboard entry found, skipping`);
       }
     } catch (error) {
-      console.error(`[DeleteAccount] Error deleting mastery leaderboard:`, error);
-      errors.push(`leaderboards/mastery: ${error}`);
-    }
-
-    // Delete from streak leaderboard
-    try {
-      console.log(`[DeleteAccount] Deleting from streak leaderboard`);
-      const streakPath = `leaderboards/streak/players/${userId}`;
-      const streak = await firestore.getDocument(streakPath);
-
-      if (streak) {
-        await firestore.deleteDocument(streakPath);
-        deletedCollections.push('leaderboards/streak');
-        console.log(`[DeleteAccount] Deleted streak leaderboard entry`);
-      } else {
-        console.log(`[DeleteAccount] No streak leaderboard entry found, skipping`);
-      }
-    } catch (error) {
-      console.error(`[DeleteAccount] Error deleting streak leaderboard:`, error);
-      errors.push(`leaderboards/streak: ${error}`);
-    }
-
-    // Delete from ELO leaderboard
-    try {
-      console.log(`[DeleteAccount] Deleting from ELO leaderboard`);
-      const eloPath = `leaderboards/elo/players/${userId}`;
-      const elo = await firestore.getDocument(eloPath);
-
-      if (elo) {
-        await firestore.deleteDocument(eloPath);
-        deletedCollections.push('leaderboards/elo');
-        console.log(`[DeleteAccount] Deleted ELO leaderboard entry`);
-      } else {
-        console.log(`[DeleteAccount] No ELO leaderboard entry found, skipping`);
-      }
-    } catch (error) {
-      console.error(`[DeleteAccount] Error deleting ELO leaderboard:`, error);
-      errors.push(`leaderboards/elo: ${error}`);
-    }
-
-    // Delete from tactical leaderboard
-    try {
-      console.log(`[DeleteAccount] Deleting from tactical leaderboard`);
-      const tacticalPath = `leaderboards/tactical/players/${userId}`;
-      const tactical = await firestore.getDocument(tacticalPath);
-
-      if (tactical) {
-        await firestore.deleteDocument(tacticalPath);
-        deletedCollections.push('leaderboards/tactical');
-        console.log(`[DeleteAccount] Deleted tactical leaderboard entry`);
-      } else {
-        console.log(`[DeleteAccount] No tactical leaderboard entry found, skipping`);
-      }
-    } catch (error) {
-      console.error(`[DeleteAccount] Error deleting tactical leaderboard:`, error);
-      errors.push(`leaderboards/tactical: ${error}`);
+      console.error(`[DeleteAccount] Error deleting leaderboard:`, error);
+      errors.push(`leaderboard: ${error}`);
     }
 
     // ========================================

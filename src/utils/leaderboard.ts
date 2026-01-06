@@ -1,22 +1,122 @@
 /**
  * Leaderboard Sync Utilities
- * Handles updating all 4 leaderboard types when user data changes
  *
- * Leaderboard Types:
- * 1. ELO - Multiplayer chess ratings
- * 2. Tactical - Puzzle solving ratings
- * 3. Mastery - Opening mastery percentage
- * 4. Streak - Consecutive practice days
+ * Unified leaderboard structure at: leaderboard/{uid}
+ *
+ * Contains all leaderboard data in a single document:
+ * - ELO rating and match stats
+ * - Tactical rating and puzzle stats
+ * - Mastery percentage and progress
+ * - Streak data
+ * - User info (username, countryCode, etc.)
  */
 
 import type { FirestoreClient } from '../firestore';
 import type { LeaderboardType } from '../types/openings';
 import { formatTimestamp } from './mastery';
 
-// ============ LEADERBOARD SYNC FUNCTIONS ============
+// Unified leaderboard collection path
+const LEADERBOARD_PATH = 'leaderboard';
 
 /**
- * Updates all applicable leaderboards for a user
+ * Unified leaderboard entry structure
+ */
+export interface LeaderboardEntry {
+  // User info
+  username?: string;
+  displayName?: string;
+  photoUrl?: string;
+  countryCode?: string;
+
+  // ELO data
+  eloRating?: number;
+  wins?: number;
+  losses?: number;
+  draws?: number;
+  totalGamesPlayed?: number;
+
+  // Tactical data
+  tacticalRating?: number;
+  puzzlesSolved?: number;
+  accuracy?: number;
+
+  // Mastery data
+  totalPoints?: number;
+  masteryPoints?: number;
+  learnPoints?: number;
+  overallMasteryPercentage?: number;
+  masteredVariations?: number;
+  totalVariations?: number;
+  openingsMasteredCount?: number;
+  totalOpeningsCount?: number;
+
+  // Streak data
+  currentStreak?: number;
+  highestStreak?: number;
+  totalSessions?: number;
+  lastSessionDate?: string;
+
+  // Meta
+  updatedAt?: string;
+}
+
+/**
+ * Updates the unified leaderboard entry for a user
+ *
+ * Only updates fields that are provided - preserves existing data for other fields
+ */
+export async function syncUserToLeaderboard(
+  firestore: FirestoreClient,
+  userId: string,
+  updates: Partial<LeaderboardEntry>
+): Promise<void> {
+  const entryPath = `${LEADERBOARD_PATH}/${userId}`;
+
+  // Build the update payload - only include defined values
+  const payload: any = {
+    updatedAt: formatTimestamp(new Date()),
+  };
+
+  // User info
+  if (updates.username !== undefined) payload.username = updates.username;
+  if (updates.displayName !== undefined) payload.displayName = updates.displayName;
+  if (updates.photoUrl !== undefined) payload.photoUrl = updates.photoUrl;
+  if (updates.countryCode !== undefined) payload.countryCode = updates.countryCode;
+
+  // ELO data
+  if (updates.eloRating !== undefined) payload.eloRating = updates.eloRating;
+  if (updates.wins !== undefined) payload.wins = updates.wins;
+  if (updates.losses !== undefined) payload.losses = updates.losses;
+  if (updates.draws !== undefined) payload.draws = updates.draws;
+  if (updates.totalGamesPlayed !== undefined) payload.totalGamesPlayed = updates.totalGamesPlayed;
+
+  // Tactical data
+  if (updates.tacticalRating !== undefined) payload.tacticalRating = updates.tacticalRating;
+  if (updates.puzzlesSolved !== undefined) payload.puzzlesSolved = updates.puzzlesSolved;
+  if (updates.accuracy !== undefined) payload.accuracy = updates.accuracy;
+
+  // Mastery data
+  if (updates.totalPoints !== undefined) payload.totalPoints = updates.totalPoints;
+  if (updates.masteryPoints !== undefined) payload.masteryPoints = updates.masteryPoints;
+  if (updates.learnPoints !== undefined) payload.learnPoints = updates.learnPoints;
+  if (updates.overallMasteryPercentage !== undefined) payload.overallMasteryPercentage = updates.overallMasteryPercentage;
+  if (updates.masteredVariations !== undefined) payload.masteredVariations = updates.masteredVariations;
+  if (updates.totalVariations !== undefined) payload.totalVariations = updates.totalVariations;
+  if (updates.openingsMasteredCount !== undefined) payload.openingsMasteredCount = updates.openingsMasteredCount;
+  if (updates.totalOpeningsCount !== undefined) payload.totalOpeningsCount = updates.totalOpeningsCount;
+
+  // Streak data
+  if (updates.currentStreak !== undefined) payload.currentStreak = updates.currentStreak;
+  if (updates.highestStreak !== undefined) payload.highestStreak = updates.highestStreak;
+  if (updates.totalSessions !== undefined) payload.totalSessions = updates.totalSessions;
+  if (updates.lastSessionDate !== undefined) payload.lastSessionDate = updates.lastSessionDate;
+
+  await firestore.setDocument(entryPath, payload, { merge: true });
+}
+
+/**
+ * Legacy function - redirects to unified sync
+ * @deprecated Use syncUserToLeaderboard instead
  */
 export async function syncUserToLeaderboards(
   firestore: FirestoreClient,
@@ -25,278 +125,74 @@ export async function syncUserToLeaderboards(
     username?: string;
     displayName?: string;
     photoUrl?: string;
-    // ELO data
+    countryCode?: string;
     eloRating?: number;
     wins?: number;
     losses?: number;
     draws?: number;
     totalGames?: number;
-    // Tactical data
     tacticalRating?: number;
     puzzlesSolved?: number;
     accuracy?: number;
-    // Mastery data
     overallMasteryPercentage?: number;
     masteredVariations?: number;
     totalVariations?: number;
     openingsMasteredCount?: number;
     totalOpeningsCount?: number;
-    // Streak data
     currentStreak?: number;
     highestStreak?: number;
     totalSessions?: number;
     lastSessionDate?: number;
   }
 ): Promise<void> {
-  const promises: Promise<void>[] = [];
-
-  // 1. Sync to ELO leaderboard if ELO rating provided
-  if (updates.eloRating !== undefined) {
-    promises.push(
-      syncToEloLeaderboard(firestore, userId, {
-        username: updates.username,
-        displayName: updates.displayName,
-        photoUrl: updates.photoUrl,
-        eloRating: updates.eloRating,
-        wins: updates.wins,
-        losses: updates.losses,
-        draws: updates.draws,
-        totalGames: updates.totalGames,
-      })
-    );
-  }
-
-  // 2. Sync to Tactical leaderboard if tactical rating provided
-  if (updates.tacticalRating !== undefined) {
-    promises.push(
-      syncToTacticalLeaderboard(firestore, userId, {
-        username: updates.username,
-        displayName: updates.displayName,
-        photoUrl: updates.photoUrl,
-        tacticalRating: updates.tacticalRating,
-        puzzlesSolved: updates.puzzlesSolved,
-        accuracy: updates.accuracy,
-      })
-    );
-  }
-
-  // 3. Sync to Mastery leaderboard if mastery data provided
-  if (updates.overallMasteryPercentage !== undefined) {
-    promises.push(
-      syncToMasteryLeaderboard(firestore, userId, {
-        username: updates.username,
-        displayName: updates.displayName,
-        photoUrl: updates.photoUrl,
-        overallMasteryPercentage: updates.overallMasteryPercentage,
-        masteredVariations: updates.masteredVariations,
-        totalVariations: updates.totalVariations,
-        openingsMasteredCount: updates.openingsMasteredCount,
-        totalOpeningsCount: updates.totalOpeningsCount,
-      })
-    );
-  }
-
-  // 4. Sync to Streak leaderboard if streak data provided
-  if (updates.currentStreak !== undefined) {
-    promises.push(
-      syncToStreakLeaderboard(firestore, userId, {
-        username: updates.username,
-        displayName: updates.displayName,
-        photoUrl: updates.photoUrl,
-        currentStreak: updates.currentStreak,
-        highestStreak: updates.highestStreak,
-        totalSessions: updates.totalSessions,
-        lastSessionDate: updates.lastSessionDate,
-      })
-    );
-  }
-
-  await Promise.all(promises);
-}
-
-// ============ INDIVIDUAL LEADERBOARD SYNC FUNCTIONS ============
-
-/**
- * Sync to ELO leaderboard
- */
-async function syncToEloLeaderboard(
-  firestore: FirestoreClient,
-  userId: string,
-  data: {
-    username?: string;
-    displayName?: string;
-    photoUrl?: string;
-    eloRating: number;
-    wins?: number;
-    losses?: number;
-    draws?: number;
-    totalGames?: number;
-  }
-): Promise<void> {
-  const entryPath = `leaderboards/elo/players/${userId}`;
-  const existingEntry = await firestore.getDocument(entryPath);
-
-  const entryData: any = {
-    userId,
-    username: data.username || existingEntry?.username || 'Unknown',
-    displayName: data.displayName || existingEntry?.displayName || data.username || 'Unknown',
-    photoUrl: data.photoUrl || existingEntry?.photoUrl || null,
-    eloRating: data.eloRating,
-    rank: null, // Computed by cron job
-    wins: data.wins !== undefined ? data.wins : (existingEntry?.wins || 0),
-    losses: data.losses !== undefined ? data.losses : (existingEntry?.losses || 0),
-    draws: data.draws !== undefined ? data.draws : (existingEntry?.draws || 0),
-    totalGames: data.totalGames !== undefined ? data.totalGames : (existingEntry?.totalGames || 0),
-    updatedAt: formatTimestamp(new Date()),
+  // Map to unified structure
+  const entry: Partial<LeaderboardEntry> = {
+    username: updates.username,
+    displayName: updates.displayName,
+    photoUrl: updates.photoUrl,
+    countryCode: updates.countryCode,
+    eloRating: updates.eloRating,
+    wins: updates.wins,
+    losses: updates.losses,
+    draws: updates.draws,
+    totalGamesPlayed: updates.totalGames,
+    tacticalRating: updates.tacticalRating,
+    puzzlesSolved: updates.puzzlesSolved,
+    accuracy: updates.accuracy,
+    overallMasteryPercentage: updates.overallMasteryPercentage,
+    masteredVariations: updates.masteredVariations,
+    totalVariations: updates.totalVariations,
+    openingsMasteredCount: updates.openingsMasteredCount,
+    totalOpeningsCount: updates.totalOpeningsCount,
+    currentStreak: updates.currentStreak,
+    highestStreak: updates.highestStreak,
+    totalSessions: updates.totalSessions,
+    lastSessionDate: updates.lastSessionDate ? new Date(updates.lastSessionDate).toISOString() : undefined,
   };
 
-  await firestore.setDocument(entryPath, entryData, { merge: true });
+  await syncUserToLeaderboard(firestore, userId, entry);
 }
 
 /**
- * Sync to Tactical leaderboard
- */
-async function syncToTacticalLeaderboard(
-  firestore: FirestoreClient,
-  userId: string,
-  data: {
-    username?: string;
-    displayName?: string;
-    photoUrl?: string;
-    tacticalRating: number;
-    puzzlesSolved?: number;
-    accuracy?: number;
-  }
-): Promise<void> {
-  const entryPath = `leaderboards/tactical/players/${userId}`;
-  const existingEntry = await firestore.getDocument(entryPath);
-
-  const entryData: any = {
-    userId,
-    username: data.username || existingEntry?.username || 'Unknown',
-    displayName: data.displayName || existingEntry?.displayName || data.username || 'Unknown',
-    photoUrl: data.photoUrl || existingEntry?.photoUrl || null,
-    tacticalRating: data.tacticalRating,
-    rank: null, // Computed by cron job
-    puzzlesSolved: data.puzzlesSolved !== undefined ? data.puzzlesSolved : (existingEntry?.puzzlesSolved || 0),
-    accuracy: data.accuracy !== undefined ? data.accuracy : (existingEntry?.accuracy || 0),
-    updatedAt: formatTimestamp(new Date()),
-  };
-
-  await firestore.setDocument(entryPath, entryData, { merge: true });
-}
-
-/**
- * Sync to Mastery leaderboard
- */
-async function syncToMasteryLeaderboard(
-  firestore: FirestoreClient,
-  userId: string,
-  data: {
-    username?: string;
-    displayName?: string;
-    photoUrl?: string;
-    overallMasteryPercentage: number;
-    masteredVariations?: number;
-    totalVariations?: number;
-    openingsMasteredCount?: number;
-    totalOpeningsCount?: number;
-  }
-): Promise<void> {
-  const entryPath = `leaderboards/mastery/players/${userId}`;
-  const existingEntry = await firestore.getDocument(entryPath);
-
-  const entryData: any = {
-    userId,
-    username: data.username || existingEntry?.username || 'Unknown',
-    displayName: data.displayName || existingEntry?.displayName || data.username || 'Unknown',
-    photoUrl: data.photoUrl || existingEntry?.photoUrl || null,
-    overallMasteryPercentage: data.overallMasteryPercentage,
-    rank: null, // Computed by cron job
-    masteredVariations: data.masteredVariations !== undefined ? data.masteredVariations : (existingEntry?.masteredVariations || 0),
-    totalVariations: data.totalVariations !== undefined ? data.totalVariations : (existingEntry?.totalVariations || 0),
-    openingsMasteredCount: data.openingsMasteredCount !== undefined ? data.openingsMasteredCount : (existingEntry?.openingsMasteredCount || 0),
-    totalOpeningsCount: data.totalOpeningsCount !== undefined ? data.totalOpeningsCount : (existingEntry?.totalOpeningsCount || 0),
-    updatedAt: formatTimestamp(new Date()),
-  };
-
-  await firestore.setDocument(entryPath, entryData, { merge: true });
-}
-
-/**
- * Sync to Streak leaderboard
- */
-async function syncToStreakLeaderboard(
-  firestore: FirestoreClient,
-  userId: string,
-  data: {
-    username?: string;
-    displayName?: string;
-    photoUrl?: string;
-    currentStreak: number;
-    highestStreak?: number;
-    totalSessions?: number;
-    lastSessionDate?: number;
-  }
-): Promise<void> {
-  const entryPath = `leaderboards/streak/players/${userId}`;
-  const existingEntry = await firestore.getDocument(entryPath);
-
-  const entryData: any = {
-    userId,
-    username: data.username || existingEntry?.username || 'Unknown',
-    displayName: data.displayName || existingEntry?.displayName || data.username || 'Unknown',
-    photoUrl: data.photoUrl || existingEntry?.photoUrl || null,
-    currentStreak: data.currentStreak,
-    rank: null, // Computed by cron job
-    highestStreak: data.highestStreak !== undefined ? data.highestStreak : (existingEntry?.highestStreak || data.currentStreak || 0),
-    totalSessions: data.totalSessions !== undefined ? data.totalSessions : (existingEntry?.totalSessions || 0),
-    lastSessionDate: data.lastSessionDate !== undefined
-      ? new Date(data.lastSessionDate).toISOString()
-      : (existingEntry?.lastSessionDate || formatTimestamp(new Date())),
-    updatedAt: formatTimestamp(new Date()),
-  };
-
-  await firestore.setDocument(entryPath, entryData, { merge: true });
-}
-
-// ============ LEADERBOARD MANAGEMENT FUNCTIONS ============
-
-/**
- * Removes a user from all leaderboards (for account deletion)
+ * Removes a user from the leaderboard (for account deletion)
  */
 export async function removeUserFromLeaderboards(
   firestore: FirestoreClient,
   userId: string
 ): Promise<void> {
-  const promises = [
-    firestore.deleteDocument(`leaderboards/elo/players/${userId}`).catch(() => {
-      // Ignore if doesn't exist
-    }),
-    firestore.deleteDocument(`leaderboards/tactical/players/${userId}`).catch(() => {
-      // Ignore if doesn't exist
-    }),
-    firestore.deleteDocument(`leaderboards/mastery/players/${userId}`).catch(() => {
-      // Ignore if doesn't exist
-    }),
-    firestore.deleteDocument(`leaderboards/streak/players/${userId}`).catch(() => {
-      // Ignore if doesn't exist
-    }),
-  ];
-
-  await Promise.all(promises);
+  await firestore.deleteDocument(`${LEADERBOARD_PATH}/${userId}`).catch(() => {
+    // Ignore if doesn't exist
+  });
 }
 
 /**
- * Gets top N users from a leaderboard
+ * Gets top N users from the leaderboard sorted by a specific field
  */
 export async function getTopLeaderboardEntries(
   firestore: FirestoreClient,
   leaderboardType: LeaderboardType,
   limit: number = 100
 ): Promise<any[]> {
-  const collectionPath = `leaderboards/${leaderboardType}/players`;
-
   // Determine sort field based on leaderboard type
   let sortField = 'eloRating';
   switch (leaderboardType) {
@@ -315,7 +211,7 @@ export async function getTopLeaderboardEntries(
   }
 
   // Query with orderBy rating/score descending
-  const entries = await firestore.queryDocuments(collectionPath, [], {
+  const entries = await firestore.queryDocuments(LEADERBOARD_PATH, [], {
     orderBy: { field: sortField, direction: 'DESCENDING' },
     limit,
   });
@@ -335,10 +231,8 @@ export async function getUserRank(
   leaderboardType: LeaderboardType,
   userId: string
 ): Promise<{ rank: number; total: number; entry: any } | null> {
-  const collectionPath = `leaderboards/${leaderboardType}/players`;
-
   // Get user's entry
-  const userEntry = await firestore.getDocument(`${collectionPath}/${userId}`);
+  const userEntry = await firestore.getDocument(`${LEADERBOARD_PATH}/${userId}`);
   if (!userEntry) {
     return null;
   }
@@ -360,17 +254,17 @@ export async function getUserRank(
       break;
   }
 
-  const userScore = userEntry[ratingField];
+  const userScore = userEntry[ratingField] || 0;
 
   // Count entries with higher scores
-  const higherScoreEntries = await firestore.queryDocuments(collectionPath, [
+  const higherScoreEntries = await firestore.queryDocuments(LEADERBOARD_PATH, [
     { field: ratingField, op: 'GREATER_THAN', value: userScore },
   ]);
 
   const rank = higherScoreEntries.length + 1;
 
   // Get total entries (could be cached)
-  const allEntries = await firestore.queryDocuments(collectionPath, []);
+  const allEntries = await firestore.queryDocuments(LEADERBOARD_PATH, []);
   const total = allEntries.length;
 
   return {
@@ -381,4 +275,15 @@ export async function getUserRank(
       rank,
     },
   };
+}
+
+/**
+ * Gets a user's leaderboard entry
+ */
+export async function getUserLeaderboardEntry(
+  firestore: FirestoreClient,
+  userId: string
+): Promise<LeaderboardEntry | null> {
+  const entry = await firestore.getDocument(`${LEADERBOARD_PATH}/${userId}`);
+  return entry as LeaderboardEntry | null;
 }

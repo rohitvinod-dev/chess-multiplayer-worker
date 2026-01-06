@@ -79,64 +79,89 @@ describe('Notification Endpoints Integration Tests', () => {
 });
 
 describe('Policy Engine Integration', () => {
-  it('should respect global opt-out', async () => {
-    const { shouldSendNotification } = await import('../../src/utils/policy-engine');
+  // Helper to create a mock trigger
+  const createTrigger = (category: 'streaks' | 'achievements' | 'engagement' | 'social') => ({
+    id: 'test_trigger',
+    category,
+    isTransactional: false,
+    priority: 'normal' as const,
+    timingStrategy: 'immediate' as const,
+    variants: [{ id: 'v1', title: 'Test', body: 'Test body', deepLink: '/test' }],
+  });
 
-    const result = await shouldSendNotification(
-      'daily_streak_reminder',
+  // Mock Firestore client that returns empty ledger
+  const mockFirestore = {
+    getDocument: async () => null,
+    queryDocuments: async () => [],
+  } as any;
+
+  it('should respect global opt-out', async () => {
+    const { checkPolicy } = await import('../../src/utils/policy-engine');
+
+    const result = await checkPolicy(
       {
-        globalOptOut: true,
-        categoryOptOuts: {},
-        quietHours: { start: 22, end: 8 },
-        frequency: 'normal',
+        userId: 'test-user',
+        trigger: createTrigger('streaks'),
+        userPrefs: {
+          enabled: false, // Global opt-out
+          categories: {},
+        },
+        scheduledTime: new Date(),
       },
-      new Date(),
-      {} as any // Firestore client mock
+      mockFirestore
     );
 
     expect(result.allowed).toBe(false);
-    expect(result.reason).toContain('global opt-out');
+    expect(result.reason).toBe('notifications_disabled');
   });
 
   it('should respect category opt-outs', async () => {
-    const { shouldSendNotification } = await import('../../src/utils/policy-engine');
+    const { checkPolicy } = await import('../../src/utils/policy-engine');
 
-    const result = await shouldSendNotification(
-      'daily_streak_reminder',
+    const result = await checkPolicy(
       {
-        globalOptOut: false,
-        categoryOptOuts: { streaks: true },
-        quietHours: { start: 22, end: 8 },
-        frequency: 'normal',
+        userId: 'test-user',
+        trigger: createTrigger('streaks'),
+        userPrefs: {
+          enabled: true,
+          categories: { streaks: false }, // Category opt-out
+        },
+        scheduledTime: new Date(),
       },
-      new Date(),
-      {} as any
+      mockFirestore
     );
 
     expect(result.allowed).toBe(false);
-    expect(result.reason).toContain('category opt-out');
+    expect(result.reason).toBe('category_disabled_streaks');
   });
 
   it('should enforce quiet hours', async () => {
-    const { shouldSendNotification } = await import('../../src/utils/policy-engine');
+    const { checkPolicy } = await import('../../src/utils/policy-engine');
 
-    // Test during quiet hours (3 AM)
-    const quietTime = new Date('2025-01-01T03:00:00Z');
+    // Create a time that's definitely in quiet hours
+    // Use local time to avoid timezone issues - set hour to 3 AM
+    const quietTime = new Date();
+    quietTime.setHours(3, 0, 0, 0); // 3 AM local time
 
-    const result = await shouldSendNotification(
-      'daily_streak_reminder',
+    // Quiet hours from 0:00 to 8:00 (simple range where 3 AM is definitely inside)
+    const result = await checkPolicy(
       {
-        globalOptOut: false,
-        categoryOptOuts: {},
-        quietHours: { start: 22, end: 8 },
-        frequency: 'normal',
+        userId: 'test-user',
+        trigger: createTrigger('streaks'),
+        userPrefs: {
+          enabled: true,
+          categories: {},
+          quietHoursEnabled: true,
+          quietHoursStart: 0,
+          quietHoursEnd: 8,
+        },
+        scheduledTime: quietTime,
       },
-      quietTime,
-      {} as any
+      mockFirestore
     );
 
     expect(result.allowed).toBe(false);
-    expect(result.reason).toContain('quiet hours');
+    expect(result.reason).toBe('quiet_hours');
   });
 
   it('should enforce daily caps', async () => {

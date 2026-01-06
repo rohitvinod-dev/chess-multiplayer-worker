@@ -320,22 +320,21 @@ export async function cleanupLeaderboardsDirectly(
   console.log('[Cron-Direct] Starting leaderboard cleanup (direct processing)...');
 
   try {
-    // Get all leaderboard entries
-    const eloEntries = await firestore.queryDocuments('leaderboards/elo/players', []);
-    const tacticalEntries = await firestore.queryDocuments('leaderboards/tactical/players', []);
+    // Get all unified leaderboard entries
+    const leaderboardEntries = await firestore.queryDocuments('leaderboard', []);
 
-    console.log(`[Cron-Direct] Found ${eloEntries.length} ELO entries, ${tacticalEntries.length} tactical entries`);
+    console.log(`[Cron-Direct] Found ${leaderboardEntries.length} leaderboard entries`);
 
     // Check each entry against user existence
-    for (const entry of eloEntries.slice(0, MAX_USERS_PER_RUN)) {
+    for (const entry of leaderboardEntries.slice(0, MAX_USERS_PER_RUN)) {
       try {
         const userId = (entry as any)._id;
         const userDoc = await firestore.getDocument(`users/${userId}`);
 
         if (!userDoc) {
           // User doesn't exist, remove from leaderboard
-          await firestore.deleteDocument(`leaderboards/elo/players/${userId}`);
-          console.log(`[Cron-Direct] Removed deleted user ${userId} from ELO leaderboard`);
+          await firestore.deleteDocument(`leaderboard/${userId}`);
+          console.log(`[Cron-Direct] Removed deleted user ${userId} from leaderboard`);
           removed++;
         }
         processed++;

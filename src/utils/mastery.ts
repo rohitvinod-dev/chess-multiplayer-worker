@@ -21,6 +21,7 @@ import type {
   FirestoreTimestamp,
 } from '../types';
 import { ENERGY_CONFIG } from '../types';
+import { isUsernameAppropriate } from './profanity-filter';
 
 // ============ UTILITY FUNCTIONS ============
 
@@ -28,18 +29,207 @@ export function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
 }
 
+/**
+ * Username validation result with details
+ */
+export interface UsernameValidationResult {
+  isValid: boolean;
+  sanitized: string | null;
+  error?: string;
+}
+
+/**
+ * Username constraints (Chess.com style + Lichess no-numbers-only rule)
+ * - Length: 3-25 characters
+ * - Allowed: letters, numbers, underscores, hyphens (NO periods)
+ * - Must start with letter or number
+ * - Must end with letter or number
+ * - Must contain at least one letter (no numbers-only)
+ * - No consecutive special characters (-- or __)
+ */
+export const USERNAME_CONSTRAINTS = {
+  minLength: 3,
+  maxLength: 25,
+  allowedPattern: /^[a-zA-Z0-9_-]+$/,
+  startsWithPattern: /^[a-zA-Z0-9]/,
+  endsWithPattern: /[a-zA-Z0-9]$/,
+  hasLetterPattern: /[a-zA-Z]/,
+  consecutiveSpecialPattern: /[-_]{2,}/,
+  reservedWords: ['no username', 'admin', 'moderator', 'system', 'checkmatex'],
+} as const;
+
+/**
+ * Validate username against all rules
+ * Returns detailed validation result
+ */
+export function validateUsername(raw?: string | null): UsernameValidationResult {
+  if (!raw || typeof raw !== 'string') {
+    return { isValid: false, sanitized: null, error: 'Username is required' };
+  }
+
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return { isValid: false, sanitized: null, error: 'Username cannot be empty' };
+  }
+
+  // Check reserved words
+  const lowerTrimmed = trimmed.toLowerCase();
+  for (const reserved of USERNAME_CONSTRAINTS.reservedWords) {
+    if (lowerTrimmed === reserved || lowerTrimmed.includes(reserved)) {
+      return { isValid: false, sanitized: null, error: 'This username is not allowed' };
+    }
+  }
+
+  // Check length
+  if (trimmed.length < USERNAME_CONSTRAINTS.minLength) {
+    return { isValid: false, sanitized: null, error: `Username must be at least ${USERNAME_CONSTRAINTS.minLength} characters` };
+  }
+  if (trimmed.length > USERNAME_CONSTRAINTS.maxLength) {
+    return { isValid: false, sanitized: null, error: `Username cannot exceed ${USERNAME_CONSTRAINTS.maxLength} characters` };
+  }
+
+  // Check allowed characters (letters, numbers, underscores, hyphens - NO periods)
+  if (!USERNAME_CONSTRAINTS.allowedPattern.test(trimmed)) {
+    return { isValid: false, sanitized: null, error: 'Username can only contain letters, numbers, underscores, and hyphens' };
+  }
+
+  // Must start with letter or number
+  if (!USERNAME_CONSTRAINTS.startsWithPattern.test(trimmed)) {
+    return { isValid: false, sanitized: null, error: 'Username must start with a letter or number' };
+  }
+
+  // Must end with letter or number
+  if (!USERNAME_CONSTRAINTS.endsWithPattern.test(trimmed)) {
+    return { isValid: false, sanitized: null, error: 'Username must end with a letter or number' };
+  }
+
+  // Must contain at least one letter (no numbers-only like Lichess)
+  if (!USERNAME_CONSTRAINTS.hasLetterPattern.test(trimmed)) {
+    return { isValid: false, sanitized: null, error: 'Username must contain at least one letter' };
+  }
+
+  // No consecutive special characters
+  if (USERNAME_CONSTRAINTS.consecutiveSpecialPattern.test(trimmed)) {
+    return { isValid: false, sanitized: null, error: 'Username cannot have consecutive underscores or hyphens' };
+  }
+
+  // Check profanity filter
+  if (!isUsernameAppropriate(trimmed)) {
+    return { isValid: false, sanitized: null, error: 'Username contains inappropriate content' };
+  }
+
+  return { isValid: true, sanitized: trimmed };
+}
+
+/**
+ * Derive a username from an email address
+ * For Google accounts like "john.doe@gmail.com", extracts "john_doe"
+ */
+export function deriveUsernameFromEmail(email: string | undefined | null): string | null {
+  if (!email || typeof email !== 'string') return null;
+
+  // Extract the part before @
+  const atIndex = email.indexOf('@');
+  if (atIndex <= 0) return null;
+
+  const localPart = email.substring(0, atIndex);
+
+  // Try to sanitize the email local part as a username
+  const sanitized = sanitizeUsername(localPart);
+  if (sanitized && validateUsername(sanitized).isValid) {
+    return sanitized;
+  }
+
+  return null;
+}
+
+/**
+ * Generate a unique username by adding numeric suffix
+ * Used when base username conflicts with existing ones
+ */
+export function generateUniqueUsernameVariant(
+  base: string,
+  takenUsernames: Set<string>
+): string | null {
+  // Try adding numeric suffixes
+  for (let i = 1; i <= 999; i++) {
+    const suffix = i.toString();
+    let candidate = base;
+
+    // Ensure we have room for the suffix
+    if (candidate.length + suffix.length > USERNAME_CONSTRAINTS.maxLength) {
+      candidate = candidate.slice(0, USERNAME_CONSTRAINTS.maxLength - suffix.length);
+      // Re-trim trailing special chars after truncation
+      candidate = candidate.replace(/[-_]+$/, '');
+    }
+
+    candidate = `${candidate}${suffix}`;
+
+    const validation = validateUsername(candidate);
+    if (validation.isValid && !takenUsernames.has(candidate.toLowerCase())) {
+      return candidate;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Sanitize username for storage/display
+ * Attempts to fix common issues, returns null if unfixable
+ *
+ * @deprecated Use validateUsername() for new code. This function exists for backward compatibility.
+ */
 export function sanitizeUsername(raw?: string | null): string | null {
   if (!raw || typeof raw !== 'string') return null;
   const trimmed = raw.trim();
   if (!trimmed) return null;
-  const sanitized = trimmed.replace(/[^a-zA-Z0-9._-]/g, '_');
+
+  // Remove disallowed characters (including periods - Chess.com style)
+  let sanitized = trimmed.replace(/[^a-zA-Z0-9_-]/g, '_');
   if (!sanitized) return null;
-  if (sanitized.toLowerCase() === 'no username') return null;
-  const truncated = sanitized.length > 16 ? sanitized.slice(0, 16) : sanitized;
-  if (truncated.length < 3) {
-    return `${truncated}${'_'.repeat(3 - truncated.length)}`;
+
+  // Check reserved words
+  const lowerSanitized = sanitized.toLowerCase();
+  for (const reserved of USERNAME_CONSTRAINTS.reservedWords) {
+    if (lowerSanitized === reserved || lowerSanitized.includes(reserved)) {
+      return null;
+    }
   }
-  return truncated;
+
+  // Collapse consecutive special characters
+  sanitized = sanitized.replace(/[-_]{2,}/g, '_');
+
+  // Trim leading special characters (must start with letter/number)
+  sanitized = sanitized.replace(/^[-_]+/, '');
+
+  // Trim trailing special characters (must end with letter/number)
+  sanitized = sanitized.replace(/[-_]+$/, '');
+
+  // Truncate to max length
+  if (sanitized.length > USERNAME_CONSTRAINTS.maxLength) {
+    sanitized = sanitized.slice(0, USERNAME_CONSTRAINTS.maxLength);
+    // Re-trim trailing special chars after truncation
+    sanitized = sanitized.replace(/[-_]+$/, '');
+  }
+
+  // Pad to min length if needed (add 'x' suffix, not underscore)
+  if (sanitized.length < USERNAME_CONSTRAINTS.minLength) {
+    sanitized = sanitized.padEnd(USERNAME_CONSTRAINTS.minLength, 'x');
+  }
+
+  // Must contain at least one letter (Lichess rule)
+  if (!USERNAME_CONSTRAINTS.hasLetterPattern.test(sanitized)) {
+    // Prepend 'u' to make it valid
+    sanitized = 'u' + sanitized;
+    if (sanitized.length > USERNAME_CONSTRAINTS.maxLength) {
+      sanitized = sanitized.slice(0, USERNAME_CONSTRAINTS.maxLength);
+    }
+  }
+
+  // Final validation
+  const validation = validateUsername(sanitized);
+  return validation.isValid ? validation.sanitized : null;
 }
 
 /**
@@ -471,7 +661,7 @@ export function formatDateKey(date: Date): string {
 
 /**
  * Format a date to human-readable string
- * Example: "December 18, 2025 at 10:28:39 AM UTC+5:30"
+ * Example: "January 4, 2026 at 11:24:19 PM UTC+5:30"
  *
  * @param date - Date object or ISO string
  * @param timezone - Optional IANA timezone (default: 'Asia/Kolkata' for UTC+5:30)
@@ -496,8 +686,11 @@ export function formatTimestamp(date: Date | string, timezone: string = 'Asia/Ko
   const parts = formatter.formatToParts(d);
   const getPart = (type: string) => parts.find(p => p.type === type)?.value || '';
 
-  // Build the formatted string: "December 18, 2025 at 10:28:39 AM UTC+5:30"
-  return `${getPart('month')} ${getPart('day')}, ${getPart('year')} at ${getPart('hour')}:${getPart('minute')}:${getPart('second')} ${getPart('dayPeriod')} ${getPart('timeZoneName')}`;
+  // Get timezone and replace GMT with UTC
+  const timeZonePart = getPart('timeZoneName').replace('GMT', 'UTC');
+
+  // Build the formatted string: "January 4, 2026 at 11:24:19 PM UTC+5:30"
+  return `${getPart('month')} ${getPart('day')}, ${getPart('year')} at ${getPart('hour')}:${getPart('minute')}:${getPart('second')} ${getPart('dayPeriod')} ${timeZonePart}`;
 }
 
 /**

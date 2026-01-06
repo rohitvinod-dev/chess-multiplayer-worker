@@ -73,7 +73,40 @@ interface BaseLeaderboardPlayer {
 }
 
 /**
- * ELO leaderboard document (leaderboards/elo/players/{uid})
+ * Unified leaderboard document (leaderboard/{uid})
+ * Contains all leaderboard data: ELO, Tactical, Mastery, and Streak
+ */
+export interface UnifiedLeaderboardPlayer extends BaseLeaderboardPlayer {
+  // ELO data
+  eloRating: number;
+  wins: number;
+  losses: number;
+  draws: number;
+  totalGamesPlayed: number;
+  provisionalGames: number;
+
+  // Tactical data
+  tacticalRating: number;
+  puzzlesSolved: number;
+
+  // Mastery data
+  overallMasteryPercentage: number;
+  masteredVariations: number;
+  totalVariations: number;
+  openingsMasteredCount: number;
+  totalOpeningsCount: number;
+  totalPoints: number;
+  masteryPoints: number;
+  learnPoints: number;
+
+  // Streak data
+  currentStreak: number;
+  highestStreak: number;
+  totalSessions: number;
+}
+
+/**
+ * @deprecated Use UnifiedLeaderboardPlayer instead - legacy interface kept for compatibility
  */
 export interface EloLeaderboardPlayer extends BaseLeaderboardPlayer {
   eloRating: number;
@@ -84,19 +117,19 @@ export interface EloLeaderboardPlayer extends BaseLeaderboardPlayer {
 }
 
 /**
- * Tactical leaderboard document (leaderboards/tactical/players/{uid})
+ * @deprecated Use UnifiedLeaderboardPlayer instead - legacy interface kept for compatibility
  */
 export interface TacticalLeaderboardPlayer extends BaseLeaderboardPlayer {
   tacticalRating: number;
   puzzlesSolved: number;
-  accuracy: number; // Percentage
+  accuracy: number;
 }
 
 /**
- * Mastery leaderboard document (leaderboards/mastery/players/{uid})
+ * @deprecated Use UnifiedLeaderboardPlayer instead - legacy interface kept for compatibility
  */
 export interface MasteryLeaderboardPlayer extends BaseLeaderboardPlayer {
-  overallMasteryPercentage: number; // 0-100 percentage
+  overallMasteryPercentage: number;
   masteredVariations: number;
   totalVariations: number;
   openingsMasteredCount: number;
@@ -104,7 +137,7 @@ export interface MasteryLeaderboardPlayer extends BaseLeaderboardPlayer {
 }
 
 /**
- * Streak leaderboard document (leaderboards/streak/players/{uid})
+ * @deprecated Use UnifiedLeaderboardPlayer instead - legacy interface kept for compatibility
  */
 export interface StreakLeaderboardPlayer extends BaseLeaderboardPlayer {
   currentStreak: number; // Current consecutive days

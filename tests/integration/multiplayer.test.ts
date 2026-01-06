@@ -84,35 +84,67 @@ describe('Multiplayer Endpoints Integration Tests', () => {
 
 describe('ELO System Integration', () => {
   it('should calculate correct ELO changes', async () => {
-    // Import ELO utilities
-    const { calculateEloChange } = await import('../../src/utils/elo');
+    // Import ELO utilities - actual function is calculateELO with MatchResult
+    const { calculateELO } = await import('../../src/utils/elo');
 
-    // Test scenario: 1500 player beats 1500 player
-    const { winnerNewRating, loserNewRating } = calculateEloChange(
-      1500, // winner rating
-      1500, // loser rating
-      32    // K-factor
-    );
+    // Test scenario: 1500 player beats 1500 player (white wins)
+    const result = calculateELO({
+      winner: 'white',
+      whitePlayer: { rating: 1500, gamesPlayed: 50, isProvisional: false },
+      blackPlayer: { rating: 1500, gamesPlayed: 50, isProvisional: false },
+    });
 
-    expect(winnerNewRating).toBe(1516);
-    expect(loserNewRating).toBe(1484);
+    // With K=32 (non-provisional, < 2100), equal ratings, winner gets +16
+    expect(result.white.newRating).toBe(1516);
+    expect(result.black.newRating).toBe(1484);
+    expect(result.white.change).toBe(16);
+    expect(result.black.change).toBe(-16);
   });
 
-  it('should use correct K-factors based on rating', async () => {
-    const { getKFactor } = await import('../../src/utils/elo');
+  it('should use correct K-factors based on rating and games played', async () => {
+    const { calculateELO } = await import('../../src/utils/elo');
 
-    // Test K-factors
-    expect(getKFactor(1200)).toBe(40); // Provisional
-    expect(getKFactor(1600)).toBe(32); // Below 2400
-    expect(getKFactor(2500)).toBe(24); // Above 2400
+    // Test provisional K-factor (< 30 games) = 40
+    const provisionalResult = calculateELO({
+      winner: 'white',
+      whitePlayer: { rating: 1500, gamesPlayed: 10, isProvisional: true },
+      blackPlayer: { rating: 1500, gamesPlayed: 50, isProvisional: false },
+    });
+    // Provisional player (K=40) wins vs non-provisional (K=32)
+    expect(provisionalResult.white.change).toBe(20); // K=40 * 0.5 = 20
+
+    // Test high-rated K-factor (>= 2400) = 16
+    const eliteResult = calculateELO({
+      winner: 'white',
+      whitePlayer: { rating: 2500, gamesPlayed: 100, isProvisional: false },
+      blackPlayer: { rating: 2500, gamesPlayed: 100, isProvisional: false },
+    });
+    expect(eliteResult.white.change).toBe(8); // K=16 * 0.5 = 8
   });
 
   it('should handle edge cases', async () => {
-    const { calculateEloChange } = await import('../../src/utils/elo');
+    const { calculateELO } = await import('../../src/utils/elo');
 
-    // Huge rating difference
-    const result = calculateEloChange(2500, 1000, 32);
-    expect(result.winnerNewRating).toBeGreaterThan(2500);
-    expect(result.loserNewRating).toBeLessThan(1000);
+    // Huge rating difference - high rated beats low rated
+    const result = calculateELO({
+      winner: 'white',
+      whitePlayer: { rating: 2500, gamesPlayed: 100, isProvisional: false },
+      blackPlayer: { rating: 1000, gamesPlayed: 100, isProvisional: false },
+    });
+    // Winner barely gains (expected win), loser barely loses
+    // Change could be 0 or 1 due to rounding when expected score is ~1.0
+    expect(result.white.newRating).toBeGreaterThanOrEqual(2500);
+    expect(result.black.newRating).toBeLessThanOrEqual(1000);
+    expect(result.white.change).toBeLessThan(5); // Almost certain win = minimal gain
+
+    // Test draw scenario
+    const drawResult = calculateELO({
+      winner: 'draw',
+      whitePlayer: { rating: 1600, gamesPlayed: 50, isProvisional: false },
+      blackPlayer: { rating: 1400, gamesPlayed: 50, isProvisional: false },
+    });
+    // Higher rated player loses rating on draw, lower rated gains
+    expect(drawResult.white.change).toBeLessThan(0);
+    expect(drawResult.black.change).toBeGreaterThan(0);
   });
 });

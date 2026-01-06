@@ -1287,14 +1287,14 @@ export class GameRoom extends Server<GameRoomEnv> {
             if (!playerId) return;
 
             const ratingsPath = `users/${playerId}/profile/ratings`;
-            const leaderboardPath = `leaderboards/elo/players/${playerId}`;
+            const leaderboardPath = `leaderboard/${playerId}`; // Unified leaderboard
 
             try {
-              // First, get current stats
+              // First, get current stats from both sources
               const currentRatings = await firestore.getDocument(ratingsPath);
               const currentLeaderboard = await firestore.getDocument(leaderboardPath);
 
-              const currentGamesPlayed = currentRatings?.gamesPlayed || currentLeaderboard?.totalGames || 0;
+              const currentGamesPlayed = currentRatings?.gamesPlayed || currentLeaderboard?.totalGamesPlayed || 0;
               const currentWins = currentRatings?.wins || currentLeaderboard?.wins || 0;
               const currentLosses = currentRatings?.losses || currentLeaderboard?.losses || 0;
               const currentDraws = currentRatings?.draws || currentLeaderboard?.draws || 0;
@@ -1323,12 +1323,12 @@ export class GameRoom extends Server<GameRoomEnv> {
               }, { merge: true });
               console.error(`✅ Updated ratings for ${playerId}: ${newRating} ELO (${newGamesPlayed} games)`);
 
-              // Update leaderboard entry (include username for display)
+              // Update unified leaderboard entry (preserves existing fields like countryCode)
               await firestore.setDocument(leaderboardPath, {
                 username: playerName || currentLeaderboard?.username || 'Unknown',
                 displayName: playerName || currentLeaderboard?.displayName || 'Unknown',
                 eloRating: newRating,
-                totalGames: newGamesPlayed,
+                totalGamesPlayed: newGamesPlayed,
                 provisionalGames: Math.min(newGamesPlayed, 30),
                 wins: newWins,
                 losses: newLosses,

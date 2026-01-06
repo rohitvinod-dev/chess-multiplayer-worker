@@ -290,6 +290,10 @@ export class UserProfile {
     const targetMap = progressType === 'mastery' ? progressMap : learnProgressMap;
     const previousLevel = clamp(parseInt(String(targetMap[variationKey]), 10) || 0, 0, 3);
 
+    console.log(`[UserProfile] Points Debug: variationKey=${variationKey}, progressType=${progressType}`);
+    console.log(`[UserProfile] Points Debug: previousLevel=${previousLevel}, targetMap[key]=${targetMap[variationKey]}`);
+    console.log(`[UserProfile] Points Debug: incoming delta=${delta}, newLevel=${newLevel}`);
+
     // Calculate delta
     let finalDelta: number;
     if (delta !== null && delta !== undefined) {
@@ -307,8 +311,11 @@ export class UserProfile {
       );
     }
 
+    console.log(`[UserProfile] Points Debug: calculated finalDelta=${finalDelta}`);
+
     // No change - early return
     if (finalDelta === 0) {
+      console.log(`[UserProfile] Points Debug: EARLY RETURN - no change (finalDelta=0)`);
       return {
         alreadyProcessed: true,
         payload: {
@@ -385,6 +392,9 @@ export class UserProfile {
         pointsAwarded += config.openingBonus;
       }
     }
+
+    console.log(`[UserProfile] Points Debug: finalNewLevel=${finalNewLevel}, pointsAwarded=${pointsAwarded}`);
+    console.log(`[UserProfile] Points Debug: variationBonus=${variationBonusAwarded}, openingBonus=${openingBonusAwarded}`);
 
     // NOTE: firstAttemptMap removed - first attempt can be derived from progress level
     // (previousLevel === 0 && finalNewLevel > 0 means first attempt)
@@ -466,12 +476,16 @@ export class UserProfile {
       const currentMasteryPoints = parseInt(String(userData.masteryPoints), 10) || 0;
       const currentLearnPoints = parseInt(String(userData.learnPoints), 10) || 0;
 
+      console.log(`[UserProfile] Points Debug: currentTotalPoints=${currentTotalPoints}, adding=${pointsAwarded}`);
+
       userUpdates.totalPoints = currentTotalPoints + pointsAwarded;
       if (progressType === 'learn') {
         userUpdates.learnPoints = currentLearnPoints + pointsAwarded;
       } else {
         userUpdates.masteryPoints = currentMasteryPoints + pointsAwarded;
       }
+
+      console.log(`[UserProfile] Points Debug: newTotalPoints=${userUpdates.totalPoints}`);
     }
 
     // Handle streak (only on first completion of day)
@@ -613,6 +627,11 @@ export class UserProfile {
       this.recordProcessedEvent(eventId, payload);
     }
 
+    // Calculate final totalPoints for GPGS sync
+    const finalTotalPoints = (parseInt(String(userData.totalPoints), 10) || 0) + pointsAwarded;
+
+    console.log(`[UserProfile] Points Debug: RETURNING finalTotalPoints=${finalTotalPoints}, pointsAwarded=${pointsAwarded}`);
+
     return {
       alreadyProcessed: false,
       variationKey,
@@ -625,6 +644,7 @@ export class UserProfile {
       openingBonusAwarded,
       stats,
       energyGranted,
+      totalPoints: finalTotalPoints, // Include for GPGS leaderboard sync
     };
   }
 

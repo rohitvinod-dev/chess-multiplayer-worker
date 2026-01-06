@@ -77,47 +77,52 @@ describe('Progress Tracking Endpoints Integration Tests', () => {
 });
 
 describe('Mastery Calculation Integration', () => {
-  it('should match Firebase Functions exactly', async () => {
-    const { calculateMastery } = await import('../../src/utils/mastery');
+  it('should calculate progress stats with 50-50 weighting', async () => {
+    const { analyzeProgressMap, computeProgressStats } = await import('../../src/utils/mastery');
 
-    // Test case from Firebase Functions
-    const result = calculateMastery({
-      currentMastery: 50,
-      learnModeSuccess: 5,
-      learnModeTotal: 10,
-      masteryModeSuccess: 3,
-      masteryModeTotal: 5,
-    });
+    // Test case: mastery and learn phases with different progress
+    const masteryMap = {
+      'Sicilian_Najdorf': 3,  // Full mastery (level 3)
+      'French_Classical': 2,  // Partial mastery (level 2)
+    };
+    const learnMap = {
+      'Sicilian_Najdorf': 2,  // Partial learn
+      'French_Classical': 3,  // Full learn
+    };
 
-    // Should use 50-50 weighted average
-    // Learn: 5/10 = 50%
-    // Mastery: 3/5 = 60%
-    // Weighted: (50 * 0.5) + (60 * 0.5) = 55
-    expect(result.newMastery).toBeCloseTo(55, 1);
+    const masteryAnalysis = analyzeProgressMap(masteryMap);
+    const learnAnalysis = analyzeProgressMap(learnMap);
+    const stats = computeProgressStats(masteryAnalysis, learnAnalysis);
+
+    // Mastery: (3 + 2) / 6 = 0.8333 = 83.33%
+    // Learn: (2 + 3) / 6 = 0.8333 = 83.33%
+    // Overall: (83.33 * 0.5) + (83.33 * 0.5) = 83.33%
+    expect(stats.overallMasteryPercentage).toBeCloseTo(83.33, 1);
   });
 
   it('should clamp mastery between 0-100', async () => {
-    const { calculateMastery } = await import('../../src/utils/mastery');
+    const { analyzeProgressMap, computeProgressStats } = await import('../../src/utils/mastery');
 
-    // Test upper bound
-    const high = calculateMastery({
-      currentMastery: 95,
-      learnModeSuccess: 10,
-      learnModeTotal: 10,
-      masteryModeSuccess: 10,
-      masteryModeTotal: 10,
-    });
-    expect(high.newMastery).toBeLessThanOrEqual(100);
+    // Test upper bound - all at max level
+    const highMap = {
+      'Opening1_Var1': 3,
+      'Opening1_Var2': 3,
+      'Opening2_Var1': 3,
+    };
+    const highAnalysis = analyzeProgressMap(highMap);
+    const highStats = computeProgressStats(highAnalysis);
+    expect(highStats.overallMasteryPercentage).toBeLessThanOrEqual(100);
+    expect(highStats.overallMasteryPercentage).toBe(100);
 
-    // Test lower bound
-    const low = calculateMastery({
-      currentMastery: 5,
-      learnModeSuccess: 0,
-      learnModeTotal: 10,
-      masteryModeSuccess: 0,
-      masteryModeTotal: 10,
-    });
-    expect(low.newMastery).toBeGreaterThanOrEqual(0);
+    // Test lower bound - all at min level
+    const lowMap = {
+      'Opening1_Var1': 0,
+      'Opening1_Var2': 0,
+    };
+    const lowAnalysis = analyzeProgressMap(lowMap);
+    const lowStats = computeProgressStats(lowAnalysis);
+    expect(lowStats.overallMasteryPercentage).toBeGreaterThanOrEqual(0);
+    expect(lowStats.overallMasteryPercentage).toBe(0);
   });
 });
 
@@ -125,17 +130,37 @@ describe('Streak Tracking Integration', () => {
   it('should calculate streaks correctly', async () => {
     const { calculateStreak } = await import('../../src/utils/mastery');
 
-    // Day 1
-    const day1 = calculateStreak(undefined, new Date('2025-01-01'));
-    expect(day1).toBe(1);
+    // First session ever (null lastSession, 0 current streak)
+    const day1 = calculateStreak(null, 0, new Date('2025-01-01T10:00:00Z'));
+    expect(day1.currentStreak).toBe(1);
+    expect(day1.shouldGrantDailyBonus).toBe(true);
 
-    // Day 2 (consecutive)
-    const day2 = calculateStreak(new Date('2025-01-01'), new Date('2025-01-02'));
-    expect(day2).toBe(2);
+    // Day 2 (consecutive) - streak 1 -> 2
+    const day2 = calculateStreak(
+      new Date('2025-01-01T10:00:00Z'),
+      1,
+      new Date('2025-01-02T10:00:00Z')
+    );
+    expect(day2.currentStreak).toBe(2);
+    expect(day2.shouldGrantDailyBonus).toBe(true);
 
-    // Day 4 (missed day 3, reset)
-    const day4 = calculateStreak(new Date('2025-01-02'), new Date('2025-01-04'));
-    expect(day4).toBe(1);
+    // Day 4 (missed day 3, reset) - streak resets to 1
+    const day4 = calculateStreak(
+      new Date('2025-01-02T10:00:00Z'),
+      5,
+      new Date('2025-01-04T10:00:00Z')
+    );
+    expect(day4.currentStreak).toBe(1);
+    expect(day4.shouldGrantDailyBonus).toBe(true);
+
+    // Same day - no bonus, streak unchanged
+    const sameDay = calculateStreak(
+      new Date('2025-01-04T08:00:00Z'),
+      3,
+      new Date('2025-01-04T15:00:00Z')
+    );
+    expect(sameDay.currentStreak).toBe(3);
+    expect(sameDay.shouldGrantDailyBonus).toBe(false);
   });
 
   it('should award energy at milestones', async () => {
