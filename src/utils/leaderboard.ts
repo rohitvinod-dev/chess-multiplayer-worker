@@ -28,17 +28,45 @@ export interface LeaderboardEntry {
   photoUrl?: string;
   countryCode?: string;
 
-  // ELO data
+  // ELO data (legacy single rating)
   eloRating?: number;
+  bestElo?: number; // Max ELO across all modes (for leaderboard queries)
   wins?: number;
   losses?: number;
   draws?: number;
   totalGamesPlayed?: number;
 
+  // Per-mode ELO ratings
+  blitzElo?: number;
+  rapidElo?: number;
+  classicalElo?: number;
+
+  // Per-mode stats - Blitz
+  blitzWins?: number;
+  blitzLosses?: number;
+  blitzDraws?: number;
+  blitzGamesPlayed?: number;
+
+  // Per-mode stats - Rapid
+  rapidWins?: number;
+  rapidLosses?: number;
+  rapidDraws?: number;
+  rapidGamesPlayed?: number;
+
+  // Per-mode stats - Classical
+  classicalWins?: number;
+  classicalLosses?: number;
+  classicalDraws?: number;
+  classicalGamesPlayed?: number;
+
   // Tactical data
   tacticalRating?: number;
   puzzlesSolved?: number;
   accuracy?: number;
+
+  // Puzzle Trouble data
+  puzzleTroubleBest?: number;
+  puzzleTroubleSessions?: number;
 
   // Mastery data
   totalPoints?: number;
@@ -83,17 +111,56 @@ export async function syncUserToLeaderboard(
   if (updates.photoUrl !== undefined) payload.photoUrl = updates.photoUrl;
   if (updates.countryCode !== undefined) payload.countryCode = updates.countryCode;
 
-  // ELO data
-  if (updates.eloRating !== undefined) payload.eloRating = updates.eloRating;
+  // ELO data (legacy single rating)
+  if (updates.eloRating !== undefined) {
+    payload.eloRating = updates.eloRating;
+    // Also update bestElo if eloRating is higher (for leaderboard queries)
+    if (updates.bestElo !== undefined) {
+      payload.bestElo = updates.bestElo;
+    } else {
+      // If bestElo not explicitly provided, set it to eloRating
+      payload.bestElo = updates.eloRating;
+    }
+  }
+  if (updates.bestElo !== undefined && updates.eloRating === undefined) {
+    payload.bestElo = updates.bestElo;
+  }
   if (updates.wins !== undefined) payload.wins = updates.wins;
   if (updates.losses !== undefined) payload.losses = updates.losses;
   if (updates.draws !== undefined) payload.draws = updates.draws;
   if (updates.totalGamesPlayed !== undefined) payload.totalGamesPlayed = updates.totalGamesPlayed;
 
+  // Per-mode ELO ratings
+  if (updates.blitzElo !== undefined) payload.blitzElo = updates.blitzElo;
+  if (updates.rapidElo !== undefined) payload.rapidElo = updates.rapidElo;
+  if (updates.classicalElo !== undefined) payload.classicalElo = updates.classicalElo;
+
+  // Per-mode stats - Blitz
+  if (updates.blitzWins !== undefined) payload.blitzWins = updates.blitzWins;
+  if (updates.blitzLosses !== undefined) payload.blitzLosses = updates.blitzLosses;
+  if (updates.blitzDraws !== undefined) payload.blitzDraws = updates.blitzDraws;
+  if (updates.blitzGamesPlayed !== undefined) payload.blitzGamesPlayed = updates.blitzGamesPlayed;
+
+  // Per-mode stats - Rapid
+  if (updates.rapidWins !== undefined) payload.rapidWins = updates.rapidWins;
+  if (updates.rapidLosses !== undefined) payload.rapidLosses = updates.rapidLosses;
+  if (updates.rapidDraws !== undefined) payload.rapidDraws = updates.rapidDraws;
+  if (updates.rapidGamesPlayed !== undefined) payload.rapidGamesPlayed = updates.rapidGamesPlayed;
+
+  // Per-mode stats - Classical
+  if (updates.classicalWins !== undefined) payload.classicalWins = updates.classicalWins;
+  if (updates.classicalLosses !== undefined) payload.classicalLosses = updates.classicalLosses;
+  if (updates.classicalDraws !== undefined) payload.classicalDraws = updates.classicalDraws;
+  if (updates.classicalGamesPlayed !== undefined) payload.classicalGamesPlayed = updates.classicalGamesPlayed;
+
   // Tactical data
   if (updates.tacticalRating !== undefined) payload.tacticalRating = updates.tacticalRating;
   if (updates.puzzlesSolved !== undefined) payload.puzzlesSolved = updates.puzzlesSolved;
   if (updates.accuracy !== undefined) payload.accuracy = updates.accuracy;
+
+  // Puzzle Trouble data
+  if (updates.puzzleTroubleBest !== undefined) payload.puzzleTroubleBest = updates.puzzleTroubleBest;
+  if (updates.puzzleTroubleSessions !== undefined) payload.puzzleTroubleSessions = updates.puzzleTroubleSessions;
 
   // Mastery data
   if (updates.totalPoints !== undefined) payload.totalPoints = updates.totalPoints;

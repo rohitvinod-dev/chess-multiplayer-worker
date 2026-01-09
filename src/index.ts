@@ -3,6 +3,7 @@ import { FirestoreClient } from './firestore';
 import { handleMatchResult } from './endpoints/multiplayer/match-result';
 import { handleRecordProgress } from './endpoints/progress/record';
 import { handleClaimEnergyReward } from './endpoints/progress/energy';
+import { handlePuzzleTroubleSubmit } from './endpoints/progress/puzzle-trouble';
 import { handleEnsureUserProfile } from './endpoints/users/profile';
 import { handleRegisterDevice } from './endpoints/users/device';
 import { handleDeleteAccount } from './endpoints/users/delete-account';
@@ -1698,6 +1699,13 @@ export default {
       if (url.pathname === '/api/progress/energy/claim' && request.method === 'POST') {
         const user = await authenticateRequest(request, env.FIREBASE_PROJECT_ID);
         const response = await handleClaimEnergyReward(request, firestore, user, env);
+        return addCorsHeaders(response, corsHeaders);
+      }
+
+      // Submit Puzzle Trouble result
+      if (url.pathname === '/api/progress/puzzle-trouble' && request.method === 'POST') {
+        const user = await authenticateRequest(request, env.FIREBASE_PROJECT_ID);
+        const response = await handlePuzzleTroubleSubmit(request, firestore, user);
         return addCorsHeaders(response, corsHeaders);
       }
 
