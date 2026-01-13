@@ -27,6 +27,9 @@ import { enqueueStreakReminders, processRemindersBatch } from './cron/daily-remi
 import { enqueueLastChanceReminders, processLastChanceBatch } from './cron/last-chance-queue';
 // Direct processing cron jobs (FREE PLAN - works without queues!)
 import { sendStreakRemindersDirectly, sendLastChanceRemindersDirectly, cleanupLeaderboardsDirectly } from './cron/direct-reminders';
+// Win-back and weekly summary cron jobs
+import { sendWinBackNotifications } from './cron/win-back-notifications';
+import { sendWeeklyProgressSummaries } from './cron/weekly-progress-summary';
 import {
   type Connection,
   Server,
@@ -1963,6 +1966,22 @@ export default {
             const result = await sendLastChanceRemindersDirectly(firestore, env);
             console.log(`[Cron] Direct last-chance result:`, result);
           }
+          break;
+        }
+
+        case '0 10 * * *': {
+          // 10 AM UTC - Win-back notifications for inactive users
+          console.log('[Cron] Sending win-back notifications...');
+          const result = await sendWinBackNotifications(firestore, env);
+          console.log(`[Cron] Win-back result:`, result);
+          break;
+        }
+
+        case '0 18 * * SUN': {
+          // 6 PM UTC on Sundays - Weekly progress summaries
+          console.log('[Cron] Sending weekly progress summaries...');
+          const result = await sendWeeklyProgressSummaries(firestore, env);
+          console.log(`[Cron] Weekly summary result:`, result);
           break;
         }
 

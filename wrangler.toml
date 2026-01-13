@@ -107,7 +107,9 @@ bindings = [
 crons = [
   "0 2 * * *",   # Daily cleanup at 2 AM UTC - Remove deleted users from leaderboards
   "0 9 * * *",   # Daily streak reminders at 9 AM UTC - Send training reminders
-  "0 21 * * *"   # Last chance reminders at 9 PM UTC - Save streaks before midnight
+  "0 21 * * *",  # Last chance reminders at 9 PM UTC - Save streaks before midnight
+  "0 10 * * *",  # Win-back notifications at 10 AM UTC - Re-engage inactive users
+  "0 18 * * SUN" # Weekly progress summary at 6 PM UTC on Sundays
 ]
 
 # Queues Configuration (Phase 5 - Scalable Cron Jobs)

@@ -5,7 +5,7 @@
 
 export interface NotificationTrigger {
   id: string;
-  category: 'streaks' | 'achievements' | 'engagement' | 'social';
+  category: 'streaks' | 'achievements' | 'engagement' | 'social' | 'win_back' | 'progress';
   isTransactional: boolean;
   priority: 'high' | 'normal';
   timingStrategy: 'immediate' | 'preferred_time_window' | 'before_midnight' | 'after_event';
@@ -26,6 +26,8 @@ export interface UserNotificationPreferences {
     achievements?: boolean;
     engagement?: boolean;
     social?: boolean;
+    win_back?: boolean;
+    progress?: boolean;
   };
   muteTemporarily?: boolean;
   muteUntil?: Date | null;
@@ -90,6 +92,8 @@ export interface UpdatePreferencesRequest {
     achievements?: boolean;
     engagement?: boolean;
     social?: boolean;
+    win_back?: boolean;
+    progress?: boolean;
   };
   muteTemporarily?: boolean;
   muteDurationHours?: number;
@@ -184,6 +188,86 @@ export const TRIGGERS: Record<string, NotificationTrigger> = {
         title: 'Ready to continue? 👋',
         body: 'You left off at {opening_name}. Resume now!',
         deepLink: '/train?resume=true',
+      },
+    ],
+  },
+  // Win-back notifications for inactive users (3-7 days)
+  win_back_3_days: {
+    id: 'win_back_3_days',
+    category: 'win_back',
+    isTransactional: false,
+    priority: 'normal',
+    timingStrategy: 'preferred_time_window',
+    variants: [
+      {
+        id: 'variant_a_miss_you',
+        title: 'We miss you! 👋',
+        body: 'Your chess openings are waiting. Come back and train!',
+        deepLink: '/train',
+      },
+      {
+        id: 'variant_b_challenge',
+        title: 'Ready for a challenge? ♟️',
+        body: "It's been a few days. Test your memory!",
+        deepLink: '/train',
+      },
+    ],
+  },
+  win_back_7_days: {
+    id: 'win_back_7_days',
+    category: 'win_back',
+    isTransactional: false,
+    priority: 'normal',
+    timingStrategy: 'preferred_time_window',
+    variants: [
+      {
+        id: 'variant_a_comeback',
+        title: 'Time to make a comeback! 🚀',
+        body: "A week away? Let's get back on track!",
+        deepLink: '/train',
+      },
+      {
+        id: 'variant_b_new_content',
+        title: "What's new in CheckmateX? 🆕",
+        body: 'Come back and discover new features!',
+        deepLink: '/train',
+      },
+    ],
+  },
+  win_back_14_days: {
+    id: 'win_back_14_days',
+    category: 'win_back',
+    isTransactional: false,
+    priority: 'normal',
+    timingStrategy: 'preferred_time_window',
+    variants: [
+      {
+        id: 'variant_a_fresh_start',
+        title: 'Fresh start? ✨',
+        body: '2 weeks is nothing. Your openings knowledge is still there!',
+        deepLink: '/train',
+      },
+    ],
+  },
+  // Weekly progress summary
+  weekly_progress_summary: {
+    id: 'weekly_progress_summary',
+    category: 'progress',
+    isTransactional: false,
+    priority: 'normal',
+    timingStrategy: 'preferred_time_window',
+    variants: [
+      {
+        id: 'variant_a_stats',
+        title: '📊 Your Weekly Progress',
+        body: '{sessions} sessions, {moves} moves practiced. Keep it up!',
+        deepLink: '/profile',
+      },
+      {
+        id: 'variant_b_motivational',
+        title: 'Week in Review 🏆',
+        body: "You've trained {sessions} times this week. Great job!",
+        deepLink: '/profile',
       },
     ],
   },
