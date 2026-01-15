@@ -36,7 +36,8 @@ import {
   type WSMessage,
   routePartykitRequest,
 } from "partyserver";
-import type { ChatMessage, Message, GameMode, ChatRole } from "./shared";
+import type { ChatMessage, Message, GameMode, ChatRole, MessageReaction } from "./shared";
+import { ALLOWED_REACTION_EMOJIS } from "./shared";
 
 // Export Durable Objects
 export { GameRoom } from './durable-objects/game-room';
@@ -129,6 +130,17 @@ export class Chat extends Server<Env> {
         metadata TEXT
       )
     `);
+
+    // Create reactions table for message reactions
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS reactions (
+        messageId TEXT NOT NULL,
+        emoji TEXT NOT NULL,
+        userId TEXT NOT NULL,
+        createdAt INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (messageId, emoji, userId)
+      )
+    `);
     // Migrate pinned_messages to include content columns
     try {
       this.ctx.storage.sql.exec(`ALTER TABLE pinned_messages ADD COLUMN content TEXT`);
@@ -183,6 +195,9 @@ export class Chat extends Server<Env> {
       metadata: row.metadata ? JSON.parse(String(row.metadata)) : undefined,
     }));
 
+    // Load reactions for all messages
+    this.loadReactionsForMessages();
+
     // Load pinned messages (from pinned_messages table which stores full content)
     const pinnedRows = this.ctx.storage.sql
       .exec(`SELECT * FROM pinned_messages ORDER BY pinnedAt DESC LIMIT 1`)
@@ -221,12 +236,39 @@ export class Chat extends Server<Env> {
     const oderId = url.searchParams.get('userId') || '';
     const banStatus = this.getUserBanStatus(oderId);
 
+    // Delta sync: check for 'since' parameter (timestamp of client's newest cached message)
+    const sinceParam = url.searchParams.get('since');
+    const since = sinceParam ? parseInt(sinceParam, 10) : null;
+
+    let messagesToSend: ChatMessage[];
+    let hasMore = false;
+
+    if (since && !isNaN(since) && since > 0) {
+      // Delta sync: send only messages newer than 'since'
+      const newerMessages = this.messages.filter((m) => m.timestamp > since);
+
+      // If there are too many new messages (>100), fall back to sending last 50
+      if (newerMessages.length > 100) {
+        messagesToSend = this.messages.slice(-50);
+        hasMore = this.messages.length > 50;
+      } else {
+        messagesToSend = newerMessages;
+        // hasMore is true if there are messages older than what we're sending
+        hasMore = this.messages.length > newerMessages.length;
+      }
+    } else {
+      // No delta sync: send most recent 50 messages
+      messagesToSend = this.messages.slice(-50);
+      hasMore = this.messages.length > 50;
+    }
+
     connection.send(
       JSON.stringify({
         type: "init",
-        messages: this.messages,
+        messages: messagesToSend,
         pinnedMessages: this.pinnedMessages,
         userBanStatus: banStatus,
+        hasMore,
       } satisfies Message),
     );
   }
@@ -673,8 +715,180 @@ export class Chat extends Server<Env> {
     return value.replace(/'/g, "''");
   }
 
+  // ===== REACTIONS MANAGEMENT =====
+
+  /**
+   * Get all reactions for a message
+   */
+  private getReactionsForMessage(messageId: string): MessageReaction[] {
+    const rows = this.ctx.storage.sql
+      .exec(`SELECT emoji, userId FROM reactions WHERE messageId = '${this.escapeSQL(messageId)}' ORDER BY emoji, createdAt`)
+      .toArray();
+
+    // Group by emoji
+    const reactionMap = new Map<string, string[]>();
+    for (const row of rows) {
+      const emoji = String(row.emoji);
+      const userId = String(row.userId);
+      if (!reactionMap.has(emoji)) {
+        reactionMap.set(emoji, []);
+      }
+      reactionMap.get(emoji)!.push(userId);
+    }
+
+    return Array.from(reactionMap.entries()).map(([emoji, userIds]) => ({
+      emoji,
+      userIds,
+    }));
+  }
+
+  /**
+   * Load reactions for all messages in cache
+   */
+  private loadReactionsForMessages(): void {
+    for (const message of this.messages) {
+      message.reactions = this.getReactionsForMessage(message.id);
+    }
+  }
+
+  /**
+   * Handle adding a reaction to a message
+   */
+  private handleAddReaction(userId: string, messageId: string, emoji: string): void {
+    // Validate emoji is allowed
+    if (!ALLOWED_REACTION_EMOJIS.includes(emoji as typeof ALLOWED_REACTION_EMOJIS[number])) {
+      console.log(`Chat: Invalid emoji ${emoji} - not in allowed list`);
+      return;
+    }
+
+    // Check if message exists
+    const message = this.messages.find(m => m.id === messageId);
+    if (!message) {
+      console.log(`Chat: Message ${messageId} not found for reaction`);
+      return;
+    }
+
+    // Check if user already reacted with this emoji
+    const existingRows = this.ctx.storage.sql
+      .exec(`SELECT 1 FROM reactions WHERE messageId = '${this.escapeSQL(messageId)}'
+             AND emoji = '${this.escapeSQL(emoji)}' AND userId = '${this.escapeSQL(userId)}'`)
+      .toArray();
+
+    if (existingRows.length > 0) {
+      console.log(`Chat: User ${userId} already reacted with ${emoji} on message ${messageId}`);
+      return;
+    }
+
+    // Add reaction
+    const createdAt = Date.now();
+    this.ctx.storage.sql.exec(`
+      INSERT INTO reactions (messageId, emoji, userId, createdAt)
+      VALUES ('${this.escapeSQL(messageId)}', '${this.escapeSQL(emoji)}', '${this.escapeSQL(userId)}', ${createdAt})
+    `);
+
+    // Update in-memory cache
+    const reactions = this.getReactionsForMessage(messageId);
+    message.reactions = reactions;
+
+    // Broadcast reaction added
+    this.broadcast(JSON.stringify({
+      type: 'reaction_added',
+      messageId,
+      emoji,
+      userId,
+      reactions,
+    }));
+
+    console.log(`Chat: User ${userId} added reaction ${emoji} to message ${messageId}`);
+  }
+
+  /**
+   * Handle removing a reaction from a message
+   */
+  private handleRemoveReaction(userId: string, messageId: string, emoji: string): void {
+    // Remove reaction from DB
+    this.ctx.storage.sql.exec(`
+      DELETE FROM reactions
+      WHERE messageId = '${this.escapeSQL(messageId)}'
+        AND emoji = '${this.escapeSQL(emoji)}'
+        AND userId = '${this.escapeSQL(userId)}'
+    `);
+
+    // Update in-memory cache
+    const message = this.messages.find(m => m.id === messageId);
+    if (message) {
+      const reactions = this.getReactionsForMessage(messageId);
+      message.reactions = reactions;
+
+      // Broadcast reaction removed
+      this.broadcast(JSON.stringify({
+        type: 'reaction_removed',
+        messageId,
+        emoji,
+        userId,
+        reactions,
+      }));
+    }
+
+    console.log(`Chat: User ${userId} removed reaction ${emoji} from message ${messageId}`);
+  }
+
+  // ===== PAGINATION =====
+
+  /**
+   * Get historical messages with pagination
+   */
+  private getHistory(before?: number, limit: number = 50): { messages: ChatMessage[]; hasMore: boolean } {
+    const actualLimit = Math.min(limit, 100); // Cap at 100 messages per request
+    const beforeTimestamp = before || Date.now() + 1;
+
+    const rows = this.ctx.storage.sql
+      .exec(`SELECT * FROM messages WHERE timestamp < ${beforeTimestamp} ORDER BY timestamp DESC LIMIT ${actualLimit + 1}`)
+      .toArray();
+
+    const hasMore = rows.length > actualLimit;
+    const messages = rows.slice(0, actualLimit).reverse().map((row: Record<string, unknown>) => {
+      const msg: ChatMessage = {
+        id: String(row.id || ''),
+        content: String(row.content || ''),
+        user: String(row.user || row.displayName || ''),
+        userId: String(row.userId || ''),
+        displayName: String(row.displayName || row.user || ''),
+        role: (row.role as ChatMessage['role']) || 'user',
+        timestamp: Number(row.timestamp) || 0,
+        metadata: row.metadata ? JSON.parse(String(row.metadata)) : undefined,
+      };
+      // Load reactions for each message
+      msg.reactions = this.getReactionsForMessage(msg.id);
+      return msg;
+    });
+
+    return { messages, hasMore };
+  }
+
   async onMessage(connection: Connection, message: WSMessage) {
     const parsed = JSON.parse(message as string) as Message;
+
+    // Handle reactions
+    if (parsed.type === 'add_reaction') {
+      this.handleAddReaction(parsed.userId, parsed.messageId, parsed.emoji);
+      return;
+    }
+    if (parsed.type === 'remove_reaction') {
+      this.handleRemoveReaction(parsed.userId, parsed.messageId, parsed.emoji);
+      return;
+    }
+
+    // Handle pagination
+    if (parsed.type === 'get_history') {
+      const { messages, hasMore } = this.getHistory(parsed.before, parsed.limit);
+      connection.send(JSON.stringify({
+        type: 'history',
+        messages,
+        hasMore,
+      }));
+      return;
+    }
 
     // Handle admin actions
     if (parsed.type === 'admin_delete') {

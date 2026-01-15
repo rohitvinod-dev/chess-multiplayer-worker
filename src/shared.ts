@@ -1,6 +1,26 @@
 // ============ CHAT TYPES ============
 export type ChatRole = "user" | "admin" | "moderator" | "system";
 
+// Reaction on a message
+export type MessageReaction = {
+  emoji: string;
+  userIds: string[];
+};
+
+// Allowed emojis for reactions (friendly only)
+export const ALLOWED_REACTION_EMOJIS = [
+  "👍", // thumbs up
+  "❤️", // heart
+  "😀", // smile
+  "🎉", // celebration
+  "♟️", // chess pawn
+  "🏆", // trophy
+  "🤔", // thinking
+  "👏", // clapping
+] as const;
+
+export type AllowedEmoji = typeof ALLOWED_REACTION_EMOJIS[number];
+
 export type ChatMessage = {
   id: string;
   content: string;
@@ -9,6 +29,7 @@ export type ChatMessage = {
   displayName: string;
   role: ChatRole;
   timestamp: number; // Unix timestamp in milliseconds
+  reactions?: MessageReaction[]; // Emoji reactions on this message
   metadata?: {
     isPinned?: boolean;
     pinnedAt?: number;
@@ -74,6 +95,7 @@ export type Message =
       messages: ChatMessage[];
       pinnedMessages?: ChatMessage[];
       userBanStatus?: { isBanned: boolean; isMuted: boolean; expiresAt?: number; reason?: string };
+      hasMore?: boolean; // True if there are older messages to load
     }
   | {
       type: "all"; // Legacy alias for init
@@ -170,6 +192,44 @@ export type Message =
       type: "error";
       code: string;
       message: string;
+    }
+  // ===== REACTIONS =====
+  | {
+      type: "add_reaction"; // User adds a reaction to a message
+      messageId: string;
+      emoji: string;
+      userId: string;
+    }
+  | {
+      type: "remove_reaction"; // User removes their reaction
+      messageId: string;
+      emoji: string;
+      userId: string;
+    }
+  | {
+      type: "reaction_added"; // Broadcast when reaction is added
+      messageId: string;
+      emoji: string;
+      userId: string;
+      reactions: MessageReaction[]; // Updated reactions array
+    }
+  | {
+      type: "reaction_removed"; // Broadcast when reaction is removed
+      messageId: string;
+      emoji: string;
+      userId: string;
+      reactions: MessageReaction[]; // Updated reactions array
+    }
+  // ===== PAGINATION =====
+  | {
+      type: "get_history"; // Request message history
+      before?: number; // Timestamp to fetch messages before
+      limit?: number; // Number of messages to fetch (default 50)
+    }
+  | {
+      type: "history"; // Response with historical messages
+      messages: ChatMessage[];
+      hasMore: boolean; // True if there are more messages to load
     };
 
 // ============ GAME TYPES ============
