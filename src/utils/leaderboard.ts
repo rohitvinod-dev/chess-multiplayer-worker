@@ -273,7 +273,7 @@ export async function getTopLeaderboardEntries(
       sortField = 'overallMasteryPercentage';
       break;
     case 'streak':
-      sortField = 'currentStreak';
+      sortField = 'highestStreak';  // Use highestStreak for all-time best rankings
       break;
   }
 
@@ -317,7 +317,7 @@ export async function getUserRank(
       ratingField = 'overallMasteryPercentage';
       break;
     case 'streak':
-      ratingField = 'currentStreak';
+      ratingField = 'highestStreak';  // Use highestStreak for all-time best rankings
       break;
   }
 

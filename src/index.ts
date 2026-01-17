@@ -13,6 +13,7 @@ import { handleTrackNotificationOpened } from './endpoints/notifications/track';
 import { handleManageOpenings } from './endpoints/openings/manage';
 import { handleSyncAchievements } from './endpoints/achievements/sync';
 import { handleMigrateUsernames } from './endpoints/admin/migrate-usernames';
+import { handleUpdateOpening } from './endpoints/admin/update-opening';
 import { handleSyncRatingsToLeaderboard } from './endpoints/admin/sync-ratings-to-leaderboard';
 import { handleMigrateEloModes } from './endpoints/admin/migrate-elo-modes';
 import { createLobbyHandler } from './endpoints/lobby/create';
@@ -2074,6 +2075,18 @@ export default {
           });
         }
         return handleMigrateEloModes(request, env);
+      }
+
+      if (url.pathname === '/api/admin/update-opening' && request.method === 'POST') {
+        // Verify admin secret
+        const adminSecret = request.headers.get('X-Admin-Secret');
+        if (adminSecret !== 'checkmatex-admin-2024') {
+          return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+            status: 401,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+        return handleUpdateOpening(request, env);
       }
 
       // ========== STATS ENDPOINTS ==========

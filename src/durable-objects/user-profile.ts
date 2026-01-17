@@ -499,6 +499,9 @@ export class UserProfile {
       streakInfo = calculateStreak(lastSessionTimestamp, currentStreak, now);
 
       userUpdates.currentStreak = streakInfo.currentStreak;
+      // Update highestStreak if current streak exceeds it
+      const currentHighest = parseInt(String(userData.highestStreak), 10) || 0;
+      userUpdates.highestStreak = Math.max(currentHighest, streakInfo.currentStreak);
       userUpdates.lastSessionDate = formatTimestamp(startOfLocalDay(now));
       userUpdates.totalSessions = (parseInt(String(userData.totalSessions), 10) || 0) + 1;
 
@@ -533,6 +536,10 @@ export class UserProfile {
 
     if (streakInfo) {
       leaderboardUpdates.currentStreak = streakInfo.currentStreak;
+      // Update highestStreak if current streak exceeds it
+      const currentHighest = parseInt(String(userData.highestStreak), 10) || 0;
+      const newHighestStreak = Math.max(currentHighest, streakInfo.currentStreak);
+      leaderboardUpdates.highestStreak = newHighestStreak;
       leaderboardUpdates.totalSessions = (parseInt(String(userData.totalSessions), 10) || 0) + 1;
     }
     if (pointsAwarded > 0) {
@@ -567,7 +574,9 @@ export class UserProfile {
 
     if (streakInfo) {
       publicDataUpdates.currentStreak = streakInfo.currentStreak;
-      publicDataUpdates.highestStreak = userData.highestStreak || streakInfo.currentStreak;
+      // Use the calculated highestStreak (already updated in userUpdates)
+      const currentHighest = parseInt(String(userData.highestStreak), 10) || 0;
+      publicDataUpdates.highestStreak = Math.max(currentHighest, streakInfo.currentStreak);
       publicDataUpdates.totalSessions = (parseInt(String(userData.totalSessions), 10) || 0) + 1;
     }
 
@@ -645,6 +654,12 @@ export class UserProfile {
       stats,
       energyGranted,
       totalPoints: finalTotalPoints, // Include for GPGS leaderboard sync
+      // Include streak info so Flutter can update UI immediately
+      streakInfo: streakInfo ? {
+        currentStreak: streakInfo.currentStreak,
+        highestStreak: userUpdates.highestStreak || streakInfo.currentStreak,
+        shouldGrantDailyBonus: streakInfo.shouldGrantDailyBonus,
+      } : null,
     };
   }
 
